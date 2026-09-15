@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-15
+
 ### Changed
 
 - Crontab parsing now follows cronie 1.7.2. Differential tests against cronie and a code review found each of these differences:
@@ -82,6 +84,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Unit and end-to-end test suites.
 - Dual MIT and Apache-2.0 licensing, with `LICENSE-MIT` and `LICENSE-APACHE`.
 
-[Unreleased]: https://github.com/quinnjr/crontab-rs/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/quinnjr/crontab-rs/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/quinnjr/crontab-rs/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/quinnjr/crontab-rs/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/quinnjr/crontab-rs/releases/tag/v0.1.0

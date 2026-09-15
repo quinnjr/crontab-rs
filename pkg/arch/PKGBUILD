@@ -7,7 +7,7 @@ pkgdesc='Cronie-compatible cron daemon and crontab utility written in Rust'
 url='https://github.com/quinnjr/crontab-rs'
 license=('MIT OR Apache-2.0')
 arch=('x86_64' 'aarch64')
-depends=('glibc' 'libgcc' 'run-parts')
+depends=('glibc' 'libgcc' 'run-parts' 'tzdata')
 makedepends=('cargo')
 optdepends=('smtp-server: send job output via email'
             'smtp-forwarder: forward job output to email server')

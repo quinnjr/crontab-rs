@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Crontab parsing now follows cronie 1.7.2. Differential tests against cronie and a code review found each of these differences:
+  - A step may only follow `*` or a range, so `5/10` is rejected.
+  - A step larger than its range is accepted with cronie's warning.
+  - Reversed ranges such as `5-3` and `sat-sun` are accepted and select nothing.
+  - Numbers follow C `int` conversion, so `4294967296` is 0 and `*/2147483648` is invalid.
+  - A random range cannot take a step, and only the value it picks must be in range.
+  - Month and weekday names must be the three-letter abbreviations. `@` shortcuts are case-sensitive.
+  - Environment lines use a port of cronie's parser, so names such as `1FOO` are valid.
+  - A `*` right after the time fields, or a missing command, is a bad command.
+  - Commands keep trailing spaces, and a NUL byte ends a line as in C.
+  - The last line must end with a newline.
+- `CRON_TZ` is resolved like glibc's `TZ`, including zoneinfo paths and POSIX strings with DST rules. An empty `CRON_TZ` means local time. Jobs with `CRON_TZ` are skipped while the local UTC offset is changing, as in cronie.
+- `RANDOM_DELAY` uses cronie's parsing and applies to the entries after it. `LANG`, `LC_*`, `LANGUAGE`, `RANDOM_DELAY` and `MAILFROM` are inherited from the daemon's environment.
+- The `-q` job option is replaced by cronie's leading `-`, which hides a job from the log. Only system crontabs and root may use it. `-n` may appear once.
+- `crond` skips only the bad lines of a crontab and loads the rest. A job naming an unknown user is skipped when it is due.
+- `crontab` stops at the first syntax error, prints the warnings before it, and uses cronie's messages. `crontab -T` checks the leading `-` against the `-u` user.
+- `crond` and `crontab` exit with status 1 on usage errors and on `-h`, as in cronie.
+- `crond -n` no longer logs every line twice when its stderr is the systemd journal, and still logs to stderr when syslog is unavailable.
+- `RANDOM_DELAY` delays a job by matching it late, as cronie does, instead of holding a job slot while sleeping.
+- Zone files are read only by `crond`, never by the set-user-ID `crontab`. FIFOs, devices and oversized files are treated as unreadable, crafted zone files can no longer abort the process, and set-ID programs get glibc's path restrictions. Zones are cached per reload.
+- Crontabs need not be UTF-8; commands and variables keep their exact bytes.
+- cronie's limits on variables, entries, comment content and field length are enforced by `crontab` and, for user crontabs, by `crond`.
+- `crontab -u` requires root even for your own name and cannot be combined with `-T`, `-n` or `-c`. `crontab` refuses to read a new crontab from a terminal without a file argument. `crontab -T` reports on stderr, and `crontab -e` exits 0 after leaving edits behind.
+- `crond` logs parser problems in cronie's format at the info level, logs an unknown user once, and backs off between syslog reconnects. Help and version output no longer panic on write errors.
+- Crontab contents are kept as raw bytes from parsing to execution, so user names, `CRON_TZ` paths, mail headers and inherited variables that are not UTF-8 are passed through exactly. NUL bytes and the comment limit in system crontabs follow cronie's reader.
+- `CRON_TZ` zones are cached by file identity with a fixed capacity and revalidated on every use, and zone paths are checked through `O_PATH` so devices are never opened.
+- Mail uses cronie's header layout and `sendmail -f`, `$NAME`/`${NAME}` in `MAILTO` and `MAILFROM` expand from the daemon's environment, an unsafe `MAILFROM` falls back to the account name, and output goes to syslog only with `-s` or when sendmail is missing.
+- `CMD`/`CMDEND` log the escaped command without its `%` input; hidden jobs never log their command. Jobs start in the job's `HOME` and are skipped when it can't be entered.
+- `crontab -u` interacts with `-T`, `-n` and `-c` in command-line order, as in cronie.
+- Library API: `Entry::quiet` is now `Entry::dont_log`, `Entry::tz` was replaced by `Entry::cron_tz`, and `Entry` fields hold raw bytes, and `Entry::random_delay` is a `RandomDelay`. `Crontab::random_delay` was removed. `Crontab::parse_with`, `Crontab::parse_bytes`, `Entry::encoding`, `ParseOptions`, `ParseOutput`, `Diagnostic` (including `BadRandomDelay` and `TooMuchGarbage`), the limit constants and the `tz` module were added. `EntryError::BadTimezone`, `BadRandomDelay` and `BadUsername` were removed, and `BadOption` and `PrematureEof` were added. `Schedule::parse_prefix_with` now takes a warnings sink.
+- The Arch package depends on `tzdata`, and `chrono-tz` is no longer a dependency.
+
 ## [0.1.1] - 2026-09-14
 
 ### Added

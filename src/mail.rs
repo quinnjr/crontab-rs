@@ -1,8 +1,10 @@
 //! Delivery of job output by mail.
 
+use std::ffi::OsStr;
 use std::io::{self, Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -25,22 +27,19 @@ pub enum Mailer {
     Off,
 }
 
-const SENDMAIL_CANDIDATES: &[&str] = &[
-    "/usr/sbin/sendmail",
-    "/usr/lib/sendmail",
-    "/usr/bin/sendmail",
-    "/sbin/sendmail",
-];
+/// cronie's `MAILARG`: the only sendmail it looks for.
+const SENDMAIL: &str = "/usr/sbin/sendmail";
 
 impl Mailer {
-    /// Locate a sendmail binary; [`Mailer::Off`] when there is none.
+    /// cronie mails through `/usr/sbin/sendmail` when it is executable;
+    /// otherwise [`Mailer::Off`] (and cronie logs output to syslog instead).
     pub fn detect() -> Mailer {
-        SENDMAIL_CANDIDATES
-            .iter()
-            .map(Path::new)
-            .find(|p| p.is_file())
-            .map(|p| Mailer::Sendmail(p.to_path_buf()))
-            .unwrap_or(Mailer::Off)
+        let path = Path::new(SENDMAIL);
+        if nix::unistd::access(path, nix::unistd::AccessFlags::X_OK).is_ok() {
+            Mailer::Sendmail(path.to_path_buf())
+        } else {
+            Mailer::Off
+        }
     }
 
     /// Parse a `-m` argument: `off` disables mail, anything else is a shell
@@ -58,15 +57,17 @@ impl Mailer {
     }
 
     /// Deliver a message, running the mailer with `creds` when given.
-    pub fn send(&self, msg: &Message, creds: Option<Creds>) -> std::io::Result<()> {
+    /// Returns the mailer's exit status (cronie logs a non-zero status);
+    /// errors are for mailers that could not be run, timed out, or stopped
+    /// reading while exiting successfully.
+    pub fn send(&self, msg: &Message, creds: Option<Creds>) -> io::Result<ExitStatus> {
         let mut cmd = match self {
-            Mailer::Off => return Ok(()),
+            Mailer::Off => return Ok(std::os::unix::process::ExitStatusExt::from_raw(0)),
             Mailer::Sendmail(path) => {
+                // cronie's MAILFMT: "%s -FCronDaemon -i -odi -oem -oi -t -f %s".
                 let mut c = Command::new(path);
-                c.args(["-FCronDaemon", "-i", "-odi", "-oem", "-oi", "-t"]);
-                if let Some(from) = &msg.envelope_from {
-                    c.arg("-f").arg(from);
-                }
+                c.args(["-FCronDaemon", "-i", "-odi", "-oem", "-oi", "-t", "-f"])
+                    .arg(OsStr::from_bytes(&msg.mailfrom));
                 c
             }
             Mailer::Command(shell) => {
@@ -138,81 +139,225 @@ impl Mailer {
         // Descendants may still hold the pipes; don't wait on them forever.
         let write_result = wrx.recv_timeout(Duration::from_secs(1)).unwrap_or(Ok(()));
         let stderr = erx.recv_timeout(Duration::from_secs(1)).unwrap_or_default();
-        let stderr = String::from_utf8_lossy(&stderr);
-        let stderr = stderr.trim();
-
-        if !status.success() {
-            return Err(io::Error::other(if stderr.is_empty() {
-                format!("mailer exited with {status}")
-            } else {
-                format!("mailer exited with {status}: {stderr}")
-            }));
+        if status.success()
+            && let Err(e) = write_result
+        {
+            let stderr = String::from_utf8_lossy(&stderr);
+            return Err(io::Error::new(
+                e.kind(),
+                format!("writing to mailer: {e} {}", stderr.trim()),
+            ));
         }
-        write_result.map_err(|e| io::Error::new(e.kind(), format!("writing to mailer: {e}")))
+        Ok(status)
     }
 }
 
-/// A job-output message.
+/// A job-output message in cronie's layout. Every field is raw bytes, as
+/// cronie writes them.
 #[derive(Debug, Clone)]
 pub struct Message {
-    pub from: String,
-    pub envelope_from: Option<String>,
-    pub to: String,
-    pub subject: String,
-    pub content_type: String,
-    pub env: Vec<(String, String)>,
+    /// Sender: MAILFROM when set and safe, otherwise the account name.
+    pub mailfrom: Vec<u8>,
+    pub mailto: Vec<u8>,
+    /// The crontab user, for the Subject.
+    pub user: Vec<u8>,
+    /// Hostname up to its first dot, for the Subject.
+    pub host: Vec<u8>,
+    /// The job's command (before any `%` input), for the Subject.
+    pub command: Vec<u8>,
+    /// Charset for the default Content-Type.
+    pub charset: Vec<u8>,
+    pub content_type: Option<Vec<u8>>,
+    pub content_transfer_encoding: Option<Vec<u8>>,
+    /// The job environment, one `X-Cron-Env` header per variable.
+    pub env: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Job output. Carriage returns are dropped when rendering, as in cronie.
     pub body: Vec<u8>,
 }
 
 impl Message {
-    /// RFC 822 text as sendmail `-t` expects it.
+    /// The message exactly as cronie's `child_process` writes it to the
+    /// mailer.
     pub fn render(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.body.len() + 512);
-        let _ = writeln!(out, "From: {}", self.from);
-        let _ = writeln!(out, "To: {}", self.to);
-        let _ = writeln!(out, "Subject: {}", self.subject);
-        let _ = writeln!(out, "Content-Type: {}", self.content_type);
-        let _ = writeln!(out, "Auto-Submitted: auto-generated");
-        let _ = writeln!(out, "Precedence: bulk");
-        let _ = writeln!(out, "MIME-Version: 1.0");
-        for (k, v) in &self.env {
-            let _ = writeln!(out, "X-Cron-Env: <{k}={v}>");
-        }
-        out.push(b'\n');
-        out.extend_from_slice(&self.body);
-        if !self.body.ends_with(b"\n") {
+        fn line(out: &mut Vec<u8>, parts: &[&[u8]]) {
+            for part in parts {
+                out.extend_from_slice(part);
+            }
             out.push(b'\n');
         }
+        let mut out = Vec::with_capacity(self.body.len() + 1024);
+        line(
+            &mut out,
+            &[b"From: \"(Cron Daemon)\" <", &self.mailfrom, b">"],
+        );
+        line(&mut out, &[b"To: ", &self.mailto]);
+        line(
+            &mut out,
+            &[
+                b"Subject: Cron <",
+                &self.user,
+                b"@",
+                &self.host,
+                b"> ",
+                &self.command,
+            ],
+        );
+        line(&mut out, &[b"MIME-Version: 1.0"]);
+        match &self.content_type {
+            None => line(
+                &mut out,
+                &[b"Content-Type: text/plain; charset=", &self.charset],
+            ),
+            Some(v) => line(&mut out, &[b"Content-Type: ", &newlines_to_spaces(v)]),
+        }
+        match &self.content_transfer_encoding {
+            None => line(&mut out, &[b"Content-Transfer-Encoding: 8bit"]),
+            Some(v) => line(
+                &mut out,
+                &[b"Content-Transfer-Encoding: ", &newlines_to_spaces(v)],
+            ),
+        }
+        line(&mut out, &[b"Auto-Submitted: auto-generated"]);
+        line(&mut out, &[b"Precedence: bulk"]);
+        for (k, v) in &self.env {
+            line(&mut out, &[b"X-Cron-Env: <", k, b"=", v, b">"]);
+        }
+        out.push(b'\n');
+        out.extend(self.body.iter().copied().filter(|&b| b != b'\r'));
         out
     }
 }
 
-/// Is this a safe `MAILTO` value (no control characters that could inject
-/// headers)?
-pub fn mailto_is_safe(value: &str) -> bool {
-    !value.chars().any(|c| c.is_control())
+/// cronie replaces newlines in user-supplied Content-Type and
+/// Content-Transfer-Encoding values so they cannot add headers.
+fn newlines_to_spaces(v: &[u8]) -> Vec<u8> {
+    v.iter()
+        .map(|&b| if b == b'\n' { b' ' } else { b })
+        .collect()
+}
+
+/// Size of cronie's `mailto_expanded`/`mailfrom_expanded` buffers
+/// (`MAX_EMAILSTR`, including the terminating NUL).
+const MAX_EMAILSTR: usize = 255;
+
+/// cronie's `find_envvar`: the offset and length of the first `$NAME` or
+/// `${NAME}` in `source`, with cronie's quirks (a digit in the first two
+/// positions ends the search, and a lone `$` counts as an empty name).
+fn find_envvar(source: &[u8]) -> Option<(usize, usize)> {
+    let start = source.iter().position(|&b| b == b'$')?;
+    let mut size = 1;
+    let mut waiting_close = false;
+    for &c in &source[start + 1..] {
+        if c == b'_' || c.is_ascii_alphanumeric() {
+            if size <= 2 && c.is_ascii_digit() {
+                return None;
+            }
+            size += 1;
+        } else if c == b'{' {
+            if size != 1 {
+                return None;
+            }
+            size += 1;
+            waiting_close = true;
+        } else if c == b'}' {
+            if (waiting_close && size == 2) || size == 1 {
+                return None;
+            }
+            if waiting_close {
+                size += 1;
+            }
+            waiting_close = false;
+            break;
+        } else {
+            break;
+        }
+    }
+    (!waiting_close).then_some((start, size))
+}
+
+/// cronie's `expand_envvar` for MAILTO and MAILFROM. Each `$NAME` or
+/// `${NAME}` becomes `lookup(NAME)`, or nothing when that is unset. Scanning
+/// stops at the first `$` that doesn't start a name cronie accepts, and the
+/// rest is copied unchanged. Returns `None` when the result would not fit
+/// cronie's buffer, in which case cronie keeps the value as written.
+pub fn expand_envvar(source: &[u8], lookup: impl Fn(&[u8]) -> Option<Vec<u8>>) -> Option<Vec<u8>> {
+    let mut result = Vec::new();
+    let mut rest = source;
+    while let Some((start, len)) = find_envvar(rest) {
+        if result.len() + start + 1 > MAX_EMAILSTR {
+            return None;
+        }
+        result.extend_from_slice(&rest[..start]);
+        let mut name = &rest[start + 1..start + len];
+        if name.first() == Some(&b'{') {
+            name = &name[1..name.len() - 1];
+        }
+        rest = &rest[start + len..];
+        if !name.is_empty()
+            && let Some(value) = lookup(name)
+        {
+            if result.len() + value.len() + 1 > MAX_EMAILSTR {
+                return None;
+            }
+            result.extend_from_slice(&value);
+        }
+    }
+    if result.len() + rest.len() + 1 > MAX_EMAILSTR {
+        return None;
+    }
+    result.extend_from_slice(rest);
+    Some(result)
+}
+
+/// cronie's `safe_p` for MAILTO and MAILFROM: printable ASCII letters and
+/// digits, plus `@!:%-.,_+` after the first character.
+pub fn safe_p(s: &[u8]) -> bool {
+    const SAFE_DELIM: &[u8] = b"@!:%-.,_+";
+    s.iter()
+        .enumerate()
+        .all(|(i, &c)| c.is_ascii_alphanumeric() || (i > 0 && SAFE_DELIM.contains(&c)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn sample() -> Message {
+        Message {
+            mailfrom: b"alice".to_vec(),
+            mailto: b"alice".to_vec(),
+            user: b"alice".to_vec(),
+            host: b"box".to_vec(),
+            command: b"echo hi".to_vec(),
+            charset: b"UTF-8".to_vec(),
+            content_type: None,
+            content_transfer_encoding: None,
+            env: vec![(b"SHELL".to_vec(), b"/bin/sh".to_vec())],
+            body: b"hi\r\n".to_vec(),
+        }
+    }
+
     #[test]
-    fn render_message() {
-        let m = Message {
-            from: "root (Cron Daemon)".into(),
-            envelope_from: None,
-            to: "alice".into(),
-            subject: "Cron <alice@host> echo hi".into(),
-            content_type: "text/plain; charset=UTF-8".into(),
-            env: vec![("SHELL".into(), "/bin/sh".into())],
-            body: b"hi".to_vec(),
+    fn render_matches_cronie() {
+        assert_eq!(
+            sample().render(),
+            b"From: \"(Cron Daemon)\" <alice>\nTo: alice\nSubject: Cron <alice@box> echo hi\n\
+MIME-Version: 1.0\nContent-Type: text/plain; charset=UTF-8\nContent-Transfer-Encoding: 8bit\n\
+Auto-Submitted: auto-generated\nPrecedence: bulk\nX-Cron-Env: <SHELL=/bin/sh>\n\nhi\n"
+                .to_vec()
+        );
+        let custom = Message {
+            content_type: Some(b"text/html\nBcc: eve".to_vec()),
+            content_transfer_encoding: Some(b"base64".to_vec()),
+            body: vec![0xe9, b'\n'],
+            ..sample()
         };
-        let text = String::from_utf8(m.render()).unwrap();
-        assert!(text.starts_with(
-            "From: root (Cron Daemon)\nTo: alice\nSubject: Cron <alice@host> echo hi\n"
-        ));
-        assert!(text.contains("X-Cron-Env: <SHELL=/bin/sh>\n\nhi\n"));
+        let text = custom.render();
+        assert!(
+            text.windows(29)
+                .any(|w| w == b"Content-Type: text/html Bcc: ")
+        );
+        assert!(text.ends_with(&[b'\n', b'\n', 0xe9, b'\n']));
     }
 
     #[test]
@@ -220,40 +365,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("mail.txt");
         let mailer = Mailer::Command(format!("cat > '{}'", out.display()));
-        let m = Message {
-            from: "x".into(),
-            envelope_from: None,
-            to: "y".into(),
-            subject: "s".into(),
-            content_type: "text/plain".into(),
-            env: vec![],
-            body: b"body\n".to_vec(),
-        };
-        mailer.send(&m, None).unwrap();
-        let text = std::fs::read_to_string(out).unwrap();
-        assert!(text.ends_with("\n\nbody\n"));
+        let status = mailer.send(&sample(), None).unwrap();
+        assert!(status.success());
+        assert!(std::fs::read(out).unwrap().ends_with(b"\n\nhi\n"));
         assert_eq!(Mailer::from_arg("OFF"), Mailer::Off);
-        assert!(Mailer::Off.send(&m, None).is_ok());
-    }
-
-    fn sample() -> Message {
-        Message {
-            from: "x".into(),
-            envelope_from: None,
-            to: "y".into(),
-            subject: "s".into(),
-            content_type: "text/plain".into(),
-            env: vec![],
-            body: b"body\n".to_vec(),
-        }
+        assert!(Mailer::Off.send(&sample(), None).unwrap().success());
     }
 
     #[test]
-    fn failing_mailer_reports_status() {
-        let err = Mailer::Command("false".into())
+    fn failing_mailer_status_is_returned() {
+        let status = Mailer::Command("false".into())
             .send(&sample(), None)
-            .unwrap_err();
-        assert!(err.to_string().contains("mailer exited with"), "{err}");
+            .unwrap();
+        assert_eq!(status.code(), Some(1));
     }
 
     #[test]
@@ -262,17 +386,47 @@ mod tests {
             body: vec![b'a'; 1 << 20],
             ..sample()
         };
-        let err = Mailer::Command("echo oops >&2; exit 3".into())
-            .send(&m, None)
-            .unwrap_err();
-        let text = err.to_string();
-        assert!(text.contains("mailer exited with"), "{text}");
-        assert!(text.contains("oops"), "{text}");
+        let status = Mailer::Command("exit 3".into()).send(&m, None).unwrap();
+        assert_eq!(status.code(), Some(3));
     }
 
     #[test]
-    fn mailto_safety() {
-        assert!(mailto_is_safe("alice@example.com, bob"));
-        assert!(!mailto_is_safe("alice\nBcc: eve"));
+    fn expand_envvar_matches_cronie() {
+        let lookup = |name: &[u8]| match name {
+            b"USER" => Some(b"alice".to_vec()),
+            b"DOM" => Some(b"example.com".to_vec()),
+            b"A1" => Some(b"x".to_vec()),
+            b"LONG" => Some(vec![b'y'; 255]),
+            _ => None,
+        };
+        let ex = |s: &[u8]| expand_envvar(s, lookup);
+        assert_eq!(ex(b"$USER@$DOM").unwrap(), b"alice@example.com");
+        assert_eq!(
+            ex(b"${USER}+cron@${DOM}").unwrap(),
+            b"alice+cron@example.com"
+        );
+        assert_eq!(ex(b"$UNSET").unwrap(), b"");
+        assert_eq!(ex(b"a$ b").unwrap(), b"a b");
+        // A digit in the first two name positions stops expansion entirely.
+        assert_eq!(ex(b"$A1 $USER").unwrap(), b"$A1 $USER");
+        assert_eq!(ex(b"$9").unwrap(), b"$9");
+        assert_eq!(ex(b"${A1}").unwrap(), b"x");
+        assert_eq!(ex(b"${USER").unwrap(), b"${USER");
+        assert_eq!(ex(b"${}").unwrap(), b"${}");
+        assert_eq!(ex(b"$USER}").unwrap(), b"alice}");
+        assert_eq!(ex(&[b'a'; 254]).unwrap(), vec![b'a'; 254]);
+        assert_eq!(ex(&[b'a'; 255]), None);
+        assert_eq!(ex(b"$LONG"), None);
+    }
+
+    #[test]
+    fn safe_p_matches_cronie() {
+        assert!(safe_p(b"alice@example.com"));
+        assert!(safe_p(b"a-b.c_d+e:f!g%h,i"));
+        assert!(!safe_p(b"-alice"));
+        assert!(!safe_p(b"alice bob"));
+        assert!(!safe_p(b"alice\nBcc: eve"));
+        assert!(!safe_p(b"eve;rm"));
+        assert!(!safe_p(&[b'j', 0xf6, b'r', b'g']));
     }
 }

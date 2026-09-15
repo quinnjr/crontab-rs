@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-09-14
+
 ### Added
 
 - `crond`, a cron daemon compatible with cronie and Vixie cron.
@@ -36,3 +38,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A systemd unit, a sample `cron.d` hourly file, and a README.
 - Unit and end-to-end test suites.
 - Dual MIT and Apache-2.0 licensing, with `LICENSE-MIT` and `LICENSE-APACHE`.
+
+[Unreleased]: https://github.com/quinnjr/crontab-rs/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/quinnjr/crontab-rs/releases/tag/v0.1.0

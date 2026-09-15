@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-14
+
+### Added
+
+- Arch Linux `PKGBUILD` that replaces cronie as the system cron. It provides `cron`, conflicts with `cronie`, and aliases `cronie.service` to `crond.service`.
+  - Ships `/etc/crontab`, `/etc/cron.deny`, `/etc/cron.d/0hourly` and the periodic job directories.
+  - Adds `/etc/cron.d/0periodic`, which runs the daily, weekly and monthly jobs with `run-parts` because there is no anacron.
+  - Adds a pacman hook that restarts `crond` after glibc or crontab-rs upgrades.
+
 ## [0.1.0] - 2026-09-14
 
 ### Added
@@ -39,5 +48,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Unit and end-to-end test suites.
 - Dual MIT and Apache-2.0 licensing, with `LICENSE-MIT` and `LICENSE-APACHE`.
 
-[Unreleased]: https://github.com/quinnjr/crontab-rs/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/quinnjr/crontab-rs/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/quinnjr/crontab-rs/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/quinnjr/crontab-rs/releases/tag/v0.1.0

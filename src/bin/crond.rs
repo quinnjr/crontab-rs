@@ -6,11 +6,10 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use chrono::{NaiveDateTime, Offset, TimeZone};
+use chrono::{Duration, NaiveDateTime, Offset, TimeZone};
 use clap::Parser;
 use nix::fcntl::{Flock, FlockArg};
 
-use crontab_rs::clock;
 use crontab_rs::config::Config;
 use crontab_rs::daemon::{Pass, Scheduler};
 use crontab_rs::database::Database;
@@ -21,7 +20,7 @@ use crontab_rs::mail::Mailer;
 #[derive(Parser, Debug)]
 #[command(
     name = "crond",
-    version,
+    version = concat!(env!("CARGO_PKG_VERSION"), " (cronie-compatible)"),
     about = "Daemon to execute scheduled commands"
 )]
 struct Cli {
@@ -76,7 +75,11 @@ fn main() -> ExitCode {
     } else if let Some(m) = &cli.mail {
         Mailer::from_arg(m)
     } else {
-        Mailer::detect()
+        let detected = Mailer::detect();
+        if detected.is_off() {
+            log::info!("(CRON) INFO (No MTA installed, job output will be logged to syslog)");
+        }
+        detected
     };
     let hostname = nix::unistd::gethostname()
         .map(|h| h.to_string_lossy().into_owned())
@@ -90,12 +93,7 @@ fn main() -> ExitCode {
     });
     let random_scale: f64 = rand::random();
     let db = Database::new(cfg.clone(), cli.permit_any, random_scale);
-    let mut sched = Scheduler {
-        db,
-        runner,
-        cluster: cli.cluster,
-        honor_delay: cli.run_at.is_none(),
-    };
+    let mut sched = Scheduler::new(db, runner, cli.cluster, cli.run_at.is_none());
 
     if let Some(spec) = &cli.run_at {
         let t = match NaiveDateTime::parse_from_str(spec, "%Y-%m-%d %H:%M") {
@@ -105,17 +103,37 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        let gmtoff = chrono::Local
-            .from_local_datetime(&t)
-            .earliest()
-            .map(|d| d.offset().fix().local_minus_utc())
+        // A wall time inside a DST gap has no local instant; use the offset
+        // in effect just before the gap (an hour earlier), then just after.
+        let offset_at = |nt: NaiveDateTime| {
+            chrono::Local
+                .from_local_datetime(&nt)
+                .earliest()
+                .map(|d| d.offset().fix().local_minus_utc())
+        };
+        let gmtoff = offset_at(t)
+            .or_else(|| offset_at(t - Duration::hours(1)))
+            .or_else(|| offset_at(t + Duration::hours(1)))
             .unwrap_or(0);
         let minute = t.and_utc().timestamp().div_euclid(60);
         sched.db.refresh();
+        let mut failed = 0usize;
         for h in sched.run_minute(minute, gmtoff, Pass::All) {
-            let _ = h.join();
+            match h.join() {
+                Ok(true) => {}
+                Ok(false) => failed += 1,
+                Err(_) => {
+                    log::error!("(CRON) ERROR (job thread panicked)");
+                    failed += 1;
+                }
+            }
         }
-        return ExitCode::SUCCESS;
+        failed += sched.take_dispatch_failures();
+        return if failed == 0 {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
     }
 
     // Single-instance lock + pid file.
@@ -145,26 +163,38 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let _ = lock.set_len(0);
-    let _ = writeln!(lock, "{}", std::process::id());
-    let _ = lock.flush();
+    let pid_written = lock
+        .set_len(0)
+        .and_then(|()| writeln!(lock, "{}", std::process::id()))
+        .and_then(|()| lock.flush());
+    if let Err(e) = pid_written {
+        log::error!(
+            "(CRON) ERROR (can't write pid file {}: {e})",
+            cfg.pid_file.display()
+        );
+    }
 
     let term = Arc::new(AtomicBool::new(false));
     let hup = Arc::new(AtomicBool::new(false));
-    for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
-        let _ = signal_hook::flag::register(sig, Arc::clone(&term));
+    let registered = [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT]
+        .into_iter()
+        .map(|sig| (sig, &term))
+        .chain(std::iter::once((signal_hook::consts::SIGHUP, &hup)))
+        .try_for_each(|(sig, flag)| signal_hook::flag::register(sig, Arc::clone(flag)).map(|_| ()));
+    if let Err(e) = registered {
+        log::error!("(CRON) DEATH (can't install signal handler: {e})");
+        return ExitCode::FAILURE;
     }
-    let _ = signal_hook::flag::register(signal_hook::consts::SIGHUP, Arc::clone(&hup));
 
     log::info!("(CRON) STARTUP ({})", env!("CARGO_PKG_VERSION"));
     sched.db.refresh();
-    let _ = clock::now();
 
     // @reboot jobs run once per boot: the marker lives on a tmpfs (/run).
     if !cfg.reboot_file.exists() {
         match std::fs::File::create(&cfg.reboot_file) {
             Ok(_) => {
                 sched.run_reboot();
+                sched.take_dispatch_failures();
             }
             Err(e) => log::error!(
                 "(CRON) INFO (can't create {}: {e}; skipping @reboot jobs)",

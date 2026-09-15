@@ -290,7 +290,195 @@ fn crond_rejects_insecure_system_file_without_p() {
         .unwrap();
     assert!(o.status.success());
     assert!(!out.exists());
-    assert!(stderr(&o).contains("INSECURE MODE") || stderr(&o).contains("WRONG FILE OWNER"));
+    // The test file is created by this (non-root) test process, so it is
+    // owned by us rather than root: the ownership check must fire first.
+    // As root, the file would be root-owned and the mode check would fire
+    // instead.
+    if nix::unistd::geteuid().is_root() {
+        assert!(stderr(&o).contains("INSECURE MODE"), "{}", stderr(&o));
+    } else {
+        assert!(stderr(&o).contains("WRONG FILE OWNER"), "{}", stderr(&o));
+    }
+}
+
+#[test]
+fn u_flag_denied_for_other_user() {
+    if nix::unistd::geteuid().is_root() {
+        return;
+    }
+    let env = Env::new();
+    let o = env.crontab(&["-u", "root", "-l"], None);
+    assert!(!o.status.success());
+    assert!(
+        stderr(&o).contains("must be privileged to use -u"),
+        "{}",
+        stderr(&o)
+    );
+}
+
+#[test]
+fn set_cluster_host_requires_root() {
+    if nix::unistd::geteuid().is_root() {
+        return;
+    }
+    let env = Env::new();
+    let o = env.crontab(&["-n", "somehost"], None);
+    assert!(!o.status.success());
+    assert!(
+        stderr(&o).contains("must be privileged to set the cluster host"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(!env.path("spool").join(".cron.hostname").exists());
+}
+
+#[test]
+fn show_cluster_host_without_hostname_file() {
+    let env = Env::new();
+    let o = env.crontab(&["-c"], None);
+    assert!(!o.status.success());
+    assert!(
+        stderr(&o).contains("no cluster host is set"),
+        "{}",
+        stderr(&o)
+    );
+}
+
+#[test]
+fn show_cluster_host_success() {
+    let env = Env::new();
+    fs::write(env.path("spool").join(".cron.hostname"), "node7\n").unwrap();
+    let o = env.crontab(&["-c"], None);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert_eq!(stdout(&o), "node7\n");
+}
+
+#[test]
+fn set_and_clear_cluster_host_as_root() {
+    if !nix::unistd::geteuid().is_root() {
+        return;
+    }
+    let env = Env::new();
+    let o = env.crontab(&["-n", "node9"], None);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let o = env.crontab(&["-c"], None);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert_eq!(stdout(&o), "node9\n");
+
+    let o = env.crontab(&["-n", ""], None);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let o = env.crontab(&["-c"], None);
+    assert!(!o.status.success());
+    assert!(
+        stderr(&o).contains("no cluster host is set"),
+        "{}",
+        stderr(&o)
+    );
+}
+
+#[test]
+fn run_at_bad_time_fails() {
+    let env = Env::new();
+    let o = env
+        .crond()
+        .args(["-m", "off", "--run-at", "garbage"])
+        .output()
+        .unwrap();
+    assert!(!o.status.success());
+    assert!(stderr(&o).contains("bad --run-at time"), "{}", stderr(&o));
+}
+
+#[test]
+fn crond_run_at_fails_when_job_cannot_run() {
+    let env = Env::new();
+    fs::write(
+        env.path("cron.d").join("badjob"),
+        "* * * * * no-such-user-xyz123 echo x\n",
+    )
+    .unwrap();
+    let o = env
+        .crond()
+        .args(["-p", "-m", "off", "--run-at", "2026-01-01 00:00"])
+        .output()
+        .unwrap();
+    assert!(!o.status.success(), "{}", stderr(&o));
+}
+
+#[test]
+fn editor_nonzero_exit_is_reported() {
+    let env = Env::new();
+    let o = env
+        .cmd(env!("CARGO_BIN_EXE_crontab"))
+        .arg("-e")
+        .env("VISUAL", "false")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!o.status.success());
+    assert!(stderr(&o).contains("exited with"), "{}", stderr(&o));
+
+    let o = env.crontab(&["-l"], None);
+    assert!(!o.status.success());
+    assert!(stderr(&o).contains(&format!("no crontab for {}", me())));
+}
+
+#[test]
+fn install_from_nonexistent_path_fails() {
+    let env = Env::new();
+    let missing = env.path("does-not-exist");
+    let o = env.crontab(&[missing.to_str().unwrap()], None);
+    assert!(!o.status.success());
+    assert!(
+        stderr(&o).contains(missing.to_str().unwrap()),
+        "{}",
+        stderr(&o)
+    );
+}
+
+#[test]
+fn version_strings_mention_cronie() {
+    let env = Env::new();
+    let o = env
+        .cmd(env!("CARGO_BIN_EXE_crontab"))
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(o.status.success());
+    assert!(stdout(&o).contains("(cronie-compatible)"), "{}", stdout(&o));
+
+    let o = env
+        .cmd(env!("CARGO_BIN_EXE_crond"))
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(o.status.success());
+    assert!(stdout(&o).contains("(cronie-compatible)"), "{}", stdout(&o));
+}
+
+#[test]
+fn edit_temp_file_is_cleaned_up() {
+    let env = Env::new();
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let script = env.path("append.sh");
+    fs::write(&script, "#!/bin/sh\necho '0 4 * * * appended' >> \"$1\"\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let o = env
+        .cmd(env!("CARGO_BIN_EXE_crontab"))
+        .arg("-e")
+        .env("VISUAL", &script)
+        .env("TMPDIR", tmp_dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", stderr(&o));
+
+    let leftovers: Vec<_> = fs::read_dir(tmp_dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("crontab."))
+        .collect();
+    assert!(leftovers.is_empty(), "{:?}", leftovers);
 }
 
 #[test]

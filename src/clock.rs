@@ -57,11 +57,10 @@ mod tests {
     fn wall_time_roundtrip() {
         let t = wall_time(29_820_249); // some minute
         assert_eq!(t.second(), 0);
-        let (m, off) = at_epoch(0);
+        let (m, _) = at_epoch(0);
         let w = wall_time(m);
         // 1970-01-01 in whatever local zone the test runs in.
         assert!(w.year() == 1970 || w.year() == 1969);
-        let _ = off;
     }
 
     #[test]

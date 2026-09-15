@@ -2,12 +2,13 @@
 
 use std::fs;
 use std::io::{self, BufRead, Read, Write};
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::path::Path;
 use std::process::{Command, ExitCode};
 
 use clap::Parser;
-use nix::unistd::{Uid, User, chown, getuid};
+use nix::sys::stat::{Mode, umask};
+use nix::unistd::{User, chown, getuid};
 
 use crontab_rs::allow::user_allowed;
 use crontab_rs::config::{Config, is_privileged_binary};
@@ -17,7 +18,7 @@ use crontab_rs::privs::{Creds, as_real_user, configure_child, gid, is_root};
 #[derive(Parser, Debug)]
 #[command(
     name = "crontab",
-    version,
+    version = concat!(env!("CARGO_PKG_VERSION"), " (cronie-compatible)"),
     about = "Maintain crontab files for individual users",
     override_usage = "crontab [-u user] <file | ->\n       crontab [-u user] <-l | -r | -e> [-i]\n       crontab -T <file | ->\n       crontab -n <host> | -c"
 )]
@@ -43,7 +44,8 @@ struct Cli {
     /// Show the cluster host.
     #[arg(short = 'c', group = "action")]
     show_host: bool,
-    /// Prompt before removing with -r.
+    /// Prompt before removing with -r (accepted and ignored with other
+    /// actions, like cronie).
     #[arg(short = 'i')]
     interactive: bool,
     /// Crontab file to install or test; `-` reads standard input.
@@ -56,6 +58,10 @@ fn fail(msg: impl std::fmt::Display) -> ExitCode {
 }
 
 fn main() -> ExitCode {
+    // Everything this program creates (spool dir, spool files, edit temp
+    // files) is private; never inherit a permissive umask from the caller.
+    umask(Mode::from_bits_truncate(0o077));
+
     let cli = Cli::parse();
     let cfg = Config::from_env();
 
@@ -64,14 +70,12 @@ fn main() -> ExitCode {
     if !file_action && cli.file.is_some() {
         return fail("a file argument cannot be combined with -l, -r, -e, -n or -c");
     }
-    if cli.interactive && !cli.remove {
-        // cronie accepts -i alone silently; do the same.
-    }
 
     let real_uid = getuid();
     let me = match User::from_uid(real_uid) {
         Ok(Some(u)) => u,
-        _ => return fail("your UID isn't in the passwd file, bailing out"),
+        Ok(None) => return fail("your UID isn't in the passwd file, bailing out"),
+        Err(e) => return fail(format!("can't look up UID {}: {e}", real_uid.as_raw())),
     };
 
     if cli.test {
@@ -149,8 +153,12 @@ fn main() -> ExitCode {
     }
 
     if cli.remove {
-        if !spool_file.exists() {
-            return fail(format!("no crontab for {}", target.name));
+        match fs::symlink_metadata(&spool_file) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return fail(format!("no crontab for {}", target.name));
+            }
+            Err(e) => return fail(format!("{}: {e}", spool_file.display())),
         }
         if cli.interactive
             && !confirm(&format!(
@@ -165,12 +173,15 @@ fn main() -> ExitCode {
                 touch_spool(&cfg);
                 ExitCode::SUCCESS
             }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                fail(format!("no crontab for {}", target.name))
+            }
             Err(e) => fail(format!("unable to delete {}: {e}", spool_file.display())),
         };
     }
 
     if cli.edit {
-        return edit(&cfg, &target, &spool_file);
+        return edit(&cfg, &me, &target, &spool_file);
     }
 
     // Install from file or stdin.
@@ -239,7 +250,10 @@ fn touch_spool(cfg: &Config) {
 fn install(cfg: &Config, target: &User, text: &str) -> io::Result<()> {
     if !cfg.spool_dir.is_dir() {
         if is_root() {
-            fs::create_dir_all(&cfg.spool_dir)?;
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&cfg.spool_dir)?;
             fs::set_permissions(&cfg.spool_dir, fs::Permissions::from_mode(0o700))?;
         } else {
             return Err(io::Error::other(format!(
@@ -293,7 +307,29 @@ fn editor() -> String {
         .unwrap_or_else(|| "vi".to_string())
 }
 
-fn edit(cfg: &Config, target: &User, spool_file: &Path) -> ExitCode {
+/// Result of an edit session: the exit code and whether the temp file must
+/// be left behind for the user (their edits could not be installed).
+struct EditOutcome {
+    code: ExitCode,
+    keep_file: bool,
+}
+
+impl EditOutcome {
+    fn done(code: ExitCode) -> Self {
+        EditOutcome {
+            code,
+            keep_file: false,
+        }
+    }
+    fn keep(code: ExitCode) -> Self {
+        EditOutcome {
+            code,
+            keep_file: true,
+        }
+    }
+}
+
+fn edit(cfg: &Config, me: &User, target: &User, spool_file: &Path) -> ExitCode {
     let original = match fs::read_to_string(spool_file) {
         Ok(t) => t,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -303,17 +339,52 @@ fn edit(cfg: &Config, target: &User, spool_file: &Path) -> ExitCode {
         Err(e) => return fail(format!("{}: {e}", spool_file.display())),
     };
 
-    // The temp file is created and edited as the invoking user.
-    let tmp = match as_real_user(|| -> io::Result<tempfile::NamedTempFile> {
-        let mut t = tempfile::Builder::new().prefix("crontab.").tempfile()?;
+    // The editor runs as the invoking user; resolve its credentials without
+    // any NSS lookup so a lookup failure can never leave it running as root.
+    let creds = match Creds::real_user() {
+        Ok(c) => c,
+        Err(e) => return fail(format!("can't determine credentials for {}: {e}", me.name)),
+    };
+
+    // The temp file is created, edited and removed as the invoking user. A
+    // set-ID binary ignores the caller-controlled $TMPDIR.
+    let tmp = match as_real_user(|| -> io::Result<tempfile::TempPath> {
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("crontab.");
+        let mut t = if is_privileged_binary() {
+            builder.tempfile_in("/tmp")?
+        } else {
+            builder.tempfile()?
+        };
         t.write_all(original.as_bytes())?;
         t.flush()?;
-        Ok(t)
+        Ok(t.into_temp_path())
     }) {
         Ok(t) => t,
         Err(e) => return fail(format!("can't create temp file: {e}")),
     };
-    let tmp_path: PathBuf = tmp.path().to_path_buf();
+
+    let outcome = edit_session(cfg, target, &original, &tmp, &creds);
+
+    // Single cleanup point, always performed with the invoker's privileges.
+    if outcome.keep_file {
+        match tmp.keep() {
+            Ok(path) => eprintln!("crontab: edits left in {}", path.display()),
+            Err(e) => eprintln!("crontab: edits left in {}", e.path.display()),
+        }
+    } else if let Err(e) = as_real_user(|| tmp.close()) {
+        eprintln!("crontab: can't remove temp file: {e}");
+    }
+    outcome.code
+}
+
+fn edit_session(
+    cfg: &Config,
+    target: &User,
+    original: &str,
+    tmp_path: &Path,
+    creds: &Creds,
+) -> EditOutcome {
     let editor = editor();
 
     loop {
@@ -321,46 +392,49 @@ fn edit(cfg: &Config, target: &User, spool_file: &Path) -> ExitCode {
         cmd.arg("-c")
             .arg(format!("{editor} \"$1\""))
             .arg("sh")
-            .arg(&tmp_path);
-        if is_privileged_binary() {
-            let invoker = User::from_uid(Uid::current()).ok().flatten();
-            configure_child(&mut cmd, invoker.as_ref().map(Creds::from_user), false);
+            .arg(tmp_path);
+        if let Err(e) = configure_child(&mut cmd, Some(creds.clone()), false, None) {
+            return EditOutcome::done(fail(format!("can't prepare editor: {e}")));
         }
         match cmd.status() {
             Ok(s) if s.success() => {}
             Ok(s) => {
-                return fail(format!(
+                return EditOutcome::done(fail(format!(
                     "\"{editor}\" exited with {s}; no changes made to crontab"
-                ));
+                )));
             }
-            Err(e) => return fail(format!("could not run \"{editor}\": {e}")),
+            Err(e) => {
+                return EditOutcome::done(fail(format!("could not run \"{editor}\": {e}")));
+            }
         }
 
-        let edited = match as_real_user(|| fs::read_to_string(&tmp_path)) {
+        let edited = match as_real_user(|| fs::read_to_string(tmp_path)) {
             Ok(t) => t,
-            Err(e) => return fail(format!("can't read edited file: {e}")),
+            Err(e) => {
+                return EditOutcome::keep(fail(format!("can't read edited file: {e}")));
+            }
         };
         if edited == original {
             eprintln!("crontab: no changes made to crontab");
-            return ExitCode::SUCCESS;
+            return EditOutcome::done(ExitCode::SUCCESS);
         }
         match Crontab::parse(&edited, Format::User) {
             Ok(_) => {
                 return match install(cfg, target, &edited) {
                     Ok(()) => {
                         eprintln!("crontab: installing new crontab");
-                        ExitCode::SUCCESS
+                        EditOutcome::done(ExitCode::SUCCESS)
                     }
-                    Err(e) => fail(format!("installing new crontab failed: {e}")),
+                    Err(e) => {
+                        EditOutcome::keep(fail(format!("installing new crontab failed: {e}")))
+                    }
                 };
             }
             Err(errors) => {
                 report_errors(&tmp_path.display().to_string(), &errors);
                 eprintln!("errors in crontab file, can't install.");
                 if !confirm("Do you want to retry the same edit? (y/n) ") {
-                    eprintln!("crontab: edits left in {}", tmp_path.display());
-                    let _ = tmp.keep();
-                    return ExitCode::FAILURE;
+                    return EditOutcome::keep(ExitCode::FAILURE);
                 }
             }
         }

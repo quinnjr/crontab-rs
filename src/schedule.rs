@@ -22,7 +22,7 @@
 use std::fmt;
 
 use chrono::{Datelike, NaiveDateTime, Timelike};
-use rand::Rng;
+use rand::{Rng, RngExt};
 
 /// Error produced while parsing a time specification.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,14 +254,21 @@ impl Schedule {
         let minute_ok = self.minutes & (1u64 << t.minute()) != 0;
         let hour_ok = self.hours & (1u32 << t.hour()) != 0;
         let month_ok = self.months & (1u16 << t.month()) != 0;
-        let dom_ok = self.days_of_month & (1u32 << t.day()) != 0;
-        let dow_ok = self.days_of_week & (1u8 << t.weekday().num_days_from_sunday()) != 0;
-        let day_ok = if self.dom_star || self.dow_star {
+        let day_ok = self.day_matches(t.day(), t.weekday().num_days_from_sunday());
+        minute_ok && hour_ok && month_ok && day_ok
+    }
+
+    /// The classic Vixie day-of-month/day-of-week rule: if both fields are
+    /// restricted (neither started with `*`), a time matches when *either*
+    /// field matches; otherwise both must match.
+    fn day_matches(&self, day_of_month: u32, weekday_from_sunday: u32) -> bool {
+        let dom_ok = self.days_of_month & (1u32 << day_of_month) != 0;
+        let dow_ok = self.days_of_week & (1u8 << weekday_from_sunday) != 0;
+        if self.dom_star || self.dow_star {
             dom_ok && dow_ok
         } else {
             dom_ok || dow_ok
-        };
-        minute_ok && hour_ok && month_ok && day_ok
+        }
     }
 
     /// The first wall-clock minute strictly after `after` at which this
@@ -286,13 +293,7 @@ impl Schedule {
                 t = chrono::NaiveDate::from_ymd_opt(y, m, 1)?.and_hms_opt(0, 0, 0)?;
                 continue;
             }
-            let dom_ok = self.days_of_month & (1u32 << t.day()) != 0;
-            let dow_ok = self.days_of_week & (1u8 << t.weekday().num_days_from_sunday()) != 0;
-            let day_ok = if self.dom_star || self.dow_star {
-                dom_ok && dow_ok
-            } else {
-                dom_ok || dow_ok
-            };
+            let day_ok = self.day_matches(t.day(), t.weekday().num_days_from_sunday());
             if !day_ok {
                 t = (t.date() + chrono::Duration::days(1)).and_hms_opt(0, 0, 0)?;
                 continue;
@@ -334,7 +335,7 @@ fn parse_range<R: Rng>(part: &str, field: Field, rng: &mut R) -> Result<u64, Sch
     let (base, step) = match part.split_once('/') {
         Some((b, s)) => {
             let step = parse_plain_number(s).ok_or(field.error())?;
-            if step == 0 {
+            if step == 0 || step > max - min + 1 {
                 return Err(field.error());
             }
             (b, Some(step))
@@ -363,7 +364,11 @@ fn parse_range<R: Rng>(part: &str, field: Field, rng: &mut R) -> Result<u64, Sch
             None => Ok(1u64 << chosen),
             Some(step) => {
                 // Random offset within the first step window, then stride.
-                let start = rng.random_range(low..=(low + step - 1).min(high));
+                let window_end = low
+                    .checked_add(step - 1)
+                    .map(|v| v.min(high))
+                    .unwrap_or(high);
+                let start = rng.random_range(low..=window_end);
                 Ok(bits_between(start, high, step))
             }
         };
@@ -388,9 +393,15 @@ fn parse_range<R: Rng>(part: &str, field: Field, rng: &mut R) -> Result<u64, Sch
 fn bits_between(low: u32, high: u32, step: u32) -> u64 {
     let mut bits = 0u64;
     let mut v = low;
-    while v <= high {
+    loop {
+        if v > high {
+            break;
+        }
         bits |= 1u64 << v;
-        v += step;
+        match v.checked_add(step) {
+            Some(next) => v = next,
+            None => break,
+        }
     }
     bits
 }
@@ -588,6 +599,27 @@ mod tests {
             Err(ScheduleError::BadTimeSpecifier)
         );
         assert_eq!(Schedule::parse("a * * * *"), Err(ScheduleError::BadMinute));
+    }
+
+    #[test]
+    fn step_bounds() {
+        assert_eq!(
+            Schedule::parse("*/4294967290 * * * *"),
+            Err(ScheduleError::BadMinute)
+        );
+        assert_eq!(
+            Schedule::parse("10-59/61 * * * *"),
+            Err(ScheduleError::BadMinute)
+        );
+        let s = sched("*/60 * * * *");
+        let fired: Vec<u32> = (0..60)
+            .filter(|m| s.matches(&at(2026, 1, 1, 0, *m)))
+            .collect();
+        assert_eq!(fired, vec![0]);
+        assert_eq!(
+            Schedule::parse("0~59/4294967295 * * * *"),
+            Err(ScheduleError::BadMinute)
+        );
     }
 
     #[test]

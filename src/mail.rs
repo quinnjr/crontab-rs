@@ -1,10 +1,18 @@
 //! Delivery of job output by mail.
 
-use std::io::Write;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use crate::privs::{Creds, configure_child};
+
+/// How long a mailer may run before it is killed.
+const MAILER_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// How much mailer stderr is kept for error reports.
+const MAX_STDERR: usize = 1024;
 
 /// How job output is delivered.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,21 +77,78 @@ impl Mailer {
         };
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        configure_child(&mut cmd, creds, false);
+            .stderr(Stdio::piped());
+        configure_child(&mut cmd, creds, false, None)?;
         let mut child = cmd.spawn()?;
-        {
-            let mut stdin = child.stdin.take().expect("piped stdin");
-            stdin.write_all(&msg.render())?;
-        }
-        let status = child.wait()?;
-        if status.success() {
-            Ok(())
+
+        // Feed stdin and drain stderr on helper threads so neither a mailer
+        // that stops reading nor one that floods stderr can block us past
+        // the deadline.
+        let (wtx, wrx) = mpsc::channel();
+        if let Some(mut stdin) = child.stdin.take() {
+            let data = msg.render();
+            std::thread::spawn(move || {
+                let r = stdin.write_all(&data);
+                drop(stdin);
+                let _ = wtx.send(r);
+            });
         } else {
-            Err(std::io::Error::other(format!(
-                "mailer exited with {status}"
-            )))
+            let _ = wtx.send(Ok(()));
         }
+        let (etx, erx) = mpsc::channel();
+        if let Some(mut stderr) = child.stderr.take() {
+            std::thread::spawn(move || {
+                let mut kept = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    match stderr.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            let room = MAX_STDERR.saturating_sub(kept.len());
+                            kept.extend_from_slice(&buf[..n.min(room)]);
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
+                    }
+                }
+                let _ = etx.send(kept);
+            });
+        } else {
+            let _ = etx.send(Vec::new());
+        }
+
+        let deadline = Instant::now() + MAILER_TIMEOUT;
+        let mut delay = Duration::from_millis(5);
+        let status = loop {
+            if let Some(s) = child.try_wait()? {
+                break s;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("mailer timed out after {}s", MAILER_TIMEOUT.as_secs()),
+                ));
+            }
+            std::thread::sleep(delay);
+            delay = (delay * 2).min(Duration::from_millis(200));
+        };
+
+        // Descendants may still hold the pipes; don't wait on them forever.
+        let write_result = wrx.recv_timeout(Duration::from_secs(1)).unwrap_or(Ok(()));
+        let stderr = erx.recv_timeout(Duration::from_secs(1)).unwrap_or_default();
+        let stderr = String::from_utf8_lossy(&stderr);
+        let stderr = stderr.trim();
+
+        if !status.success() {
+            return Err(io::Error::other(if stderr.is_empty() {
+                format!("mailer exited with {status}")
+            } else {
+                format!("mailer exited with {status}: {stderr}")
+            }));
+        }
+        write_result.map_err(|e| io::Error::new(e.kind(), format!("writing to mailer: {e}")))
     }
 }
 
@@ -169,6 +234,40 @@ mod tests {
         assert!(text.ends_with("\n\nbody\n"));
         assert_eq!(Mailer::from_arg("OFF"), Mailer::Off);
         assert!(Mailer::Off.send(&m, None).is_ok());
+    }
+
+    fn sample() -> Message {
+        Message {
+            from: "x".into(),
+            envelope_from: None,
+            to: "y".into(),
+            subject: "s".into(),
+            content_type: "text/plain".into(),
+            env: vec![],
+            body: b"body\n".to_vec(),
+        }
+    }
+
+    #[test]
+    fn failing_mailer_reports_status() {
+        let err = Mailer::Command("false".into())
+            .send(&sample(), None)
+            .unwrap_err();
+        assert!(err.to_string().contains("mailer exited with"), "{err}");
+    }
+
+    #[test]
+    fn mailer_exiting_without_reading_is_reaped() {
+        let m = Message {
+            body: vec![b'a'; 1 << 20],
+            ..sample()
+        };
+        let err = Mailer::Command("echo oops >&2; exit 3".into())
+            .send(&m, None)
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("mailer exited with"), "{text}");
+        assert!(text.contains("oops"), "{text}");
     }
 
     #[test]

@@ -13,7 +13,7 @@ use crate::mail::{Mailer, Message, mailto_is_safe};
 use crate::privs::{Creds, configure_child};
 
 /// Upper bound on job output retained for mail/log (the rest is drained).
-const MAX_OUTPUT: usize = 16 * 1024 * 1024;
+const MAX_OUTPUT: usize = 1024 * 1024;
 
 /// Shared settings for running jobs.
 #[derive(Debug, Clone)]
@@ -67,12 +67,30 @@ impl Runner {
         let pw = User::from_name(user)
             .map_err(io::Error::other)?
             .ok_or_else(|| io::Error::other(format!("no passwd entry for {user}")))?;
-        let switch = geteuid().is_root();
-        if !switch && pw.uid != geteuid() {
-            return Err(io::Error::other(format!(
-                "cannot run job as {user}: daemon is not running as root"
-            )));
+        let switch = should_switch(geteuid().as_raw(), pw.uid.as_raw())
+            .map_err(|e| io::Error::other(format!("cannot run job as {user}: {e}")))?;
+        if switch
+            && pw.uid.as_raw() != 0
+            && let Some(expire) = shadow_expire(user)
+            && account_expired(expire, today_days())
+        {
+            log::error!("({user}) ACCOUNT EXPIRED (job not run)");
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("account {user} has expired"),
+            ));
         }
+        let creds = if switch {
+            match Creds::from_user(&pw) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    log::error!("({user}) ERROR (cannot resolve credentials: {e})");
+                    return Err(e);
+                }
+            }
+        } else {
+            None
+        };
         let env = self.build_env(&pw, entry);
         let shell = env_get(&env, "SHELL").unwrap_or("/bin/sh").to_string();
 
@@ -80,7 +98,9 @@ impl Runner {
             log::info!("({user}) CMD ({})", entry.raw_command);
         }
 
-        let (read_end, write_end) = nix::unistd::pipe().map_err(io::Error::other)?;
+        let (read_end, write_end) =
+            nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).map_err(io::Error::other)?;
+        // try_clone uses F_DUPFD_CLOEXEC, so the duplicate is close-on-exec too.
         let write_dup = write_end.try_clone()?;
 
         let mut cmd = Command::new(&shell);
@@ -89,7 +109,6 @@ impl Runner {
             .arg(&entry.command)
             .env_clear()
             .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-            .current_dir(&pw.dir)
             .stdout(Stdio::from(write_end))
             .stderr(Stdio::from(write_dup))
             .stdin(if entry.stdin.is_some() {
@@ -97,7 +116,10 @@ impl Runner {
             } else {
                 Stdio::null()
             });
-        configure_child(&mut cmd, switch.then(|| Creds::from_user(&pw)), true);
+        if let Err(e) = configure_child(&mut cmd, creds, true, Some(pw.dir.clone())) {
+            log::error!("({user}) ERROR (can't prepare job: {e})");
+            return Err(e);
+        }
 
         let spawned = cmd.spawn();
         // Close our copies of the pipe's write end so EOF arrives when the
@@ -112,13 +134,14 @@ impl Runner {
         };
 
         let stdin_thread = match (child.stdin.take(), entry.stdin.clone()) {
-            (Some(mut pipe), Some(data)) => Some(std::thread::spawn(move || {
-                let _ = pipe.write_all(data.as_bytes());
+            (Some(mut pipe), Some(data)) => Some(std::thread::spawn(move || -> io::Result<()> {
+                pipe.write_all(data.as_bytes())
             })),
             _ => None,
         };
 
         let mut output = Vec::new();
+        let mut discarded: u64 = 0;
         let mut reader = File::from(read_end);
         let mut buf = [0u8; 8192];
         loop {
@@ -126,15 +149,32 @@ impl Runner {
                 Ok(0) => break,
                 Ok(n) => {
                     let room = MAX_OUTPUT.saturating_sub(output.len());
-                    output.extend_from_slice(&buf[..n.min(room)]);
+                    let keep = n.min(room);
+                    output.extend_from_slice(&buf[..keep]);
+                    discarded += (n - keep) as u64;
                 }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
+                Err(e) => {
+                    log::error!("({user}) ERROR (reading job output: {e})");
+                    break;
+                }
             }
+        }
+        drop(reader);
+        if discarded > 0 {
+            log::warn!("({user}) ERROR (job output truncated: {discarded} bytes discarded)");
+            output.extend_from_slice(
+                format!("\n[crond: {discarded} bytes of output discarded]\n").as_bytes(),
+            );
         }
         let status = child.wait()?;
         if let Some(t) = stdin_thread {
-            let _ = t.join();
+            match t.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) if e.kind() == io::ErrorKind::BrokenPipe => {}
+                Ok(Err(e)) => log::error!("({user}) ERROR (writing job stdin: {e})"),
+                Err(_) => log::error!("({user}) ERROR (job stdin writer panicked)"),
+            }
         }
 
         if !entry.quiet {
@@ -205,7 +245,17 @@ impl Runner {
                 .collect(),
             body: output.to_vec(),
         };
-        let creds = switch.then(|| Creds::from_user(pw));
+        let creds = if switch {
+            match Creds::from_user(pw) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    log::error!("({user}) MAIL ERROR (cannot resolve credentials: {e})");
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         match self.mailer.send(&msg, creds) {
             Ok(()) => log::debug!("({user}) MAIL (mailed {} bytes to {mailto})", output.len()),
             Err(e) => log::error!("({user}) MAIL ERROR ({e})"),
@@ -213,10 +263,126 @@ impl Runner {
     }
 }
 
+/// Decide whether a job for `target_uid` needs an identity switch when the
+/// daemon runs with effective uid `euid`.
+pub fn should_switch(euid: u32, target_uid: u32) -> Result<bool, String> {
+    if euid == 0 {
+        Ok(true)
+    } else if euid == target_uid {
+        Ok(false)
+    } else {
+        Err("daemon is not running as root".into())
+    }
+}
+
+/// Is an account with shadow `sp_expire` (days since the epoch; `<= 0`
+/// meaning never) expired on day `today_days`?
+fn account_expired(sp_expire: i64, today_days: i64) -> bool {
+    sp_expire > 0 && today_days >= sp_expire
+}
+
+/// Days since the Unix epoch, UTC.
+fn today_days() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.as_secs() / 86_400) as i64)
+        .unwrap_or(0)
+}
+
+/// The shadow `sp_expire` field for `user`, or `None` when the shadow
+/// database can't be read or has no entry (which never blocks a job).
+fn shadow_expire(user: &str) -> Option<i64> {
+    let name = std::ffi::CString::new(user).ok()?;
+    let mut buflen = 1024usize;
+    loop {
+        let mut buf = vec![0 as libc::c_char; buflen];
+        // SAFETY: an all-zero spwd is a valid value (null pointers, zero ints).
+        let mut sp: libc::spwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::spwd = std::ptr::null_mut();
+        // SAFETY: all pointers are valid for the given sizes for the call's duration.
+        let rc = unsafe {
+            libc::getspnam_r(
+                name.as_ptr(),
+                &mut sp,
+                buf.as_mut_ptr(),
+                buflen,
+                &mut result,
+            )
+        };
+        if rc == libc::ERANGE && buflen < 1 << 20 {
+            buflen *= 4;
+            continue;
+        }
+        if rc != 0 || result.is_null() {
+            return None;
+        }
+        return Some(sp.sp_expire as i64);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::crontab::{Crontab, Format};
+
+    #[test]
+    fn switch_decision() {
+        assert_eq!(should_switch(0, 1000), Ok(true));
+        assert_eq!(should_switch(0, 0), Ok(true));
+        assert_eq!(should_switch(1000, 1000), Ok(false));
+        assert!(
+            should_switch(1000, 0)
+                .unwrap_err()
+                .contains("daemon is not running as root")
+        );
+    }
+
+    #[test]
+    fn account_expiry() {
+        assert!(!account_expired(-1, 20_000));
+        assert!(!account_expired(0, 20_000));
+        assert!(!account_expired(20_001, 20_000));
+        assert!(account_expired(20_000, 20_000));
+        assert!(account_expired(19_999, 20_000));
+    }
+
+    #[test]
+    fn non_root_cannot_run_as_root() {
+        if geteuid().is_root() {
+            return;
+        }
+        let err = runner(Mailer::Off)
+            .run("root", &entry("* * * * * true\n"))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("daemon is not running as root"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn unknown_user_is_rejected() {
+        let err = runner(Mailer::Off)
+            .run("no-such-user-xyz123", &entry("* * * * * true\n"))
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("no passwd entry for no-such-user-xyz123"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn oversized_output_is_truncated_with_notice() {
+        let e = entry("* * * * * head -c 1100000 /dev/zero\n");
+        let out = runner(Mailer::Off).run(&me().name, &e).unwrap();
+        let tail = format!(
+            "\n[crond: {} bytes of output discarded]\n",
+            1_100_000 - MAX_OUTPUT
+        );
+        assert!(out.output.ends_with(tail.as_bytes()));
+        assert_eq!(out.output.len(), MAX_OUTPUT + tail.len());
+    }
 
     fn me() -> User {
         User::from_uid(nix::unistd::getuid()).unwrap().unwrap()

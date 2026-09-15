@@ -331,7 +331,6 @@ pub fn split_command(raw: &str) -> (String, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::NaiveDate;
 
     #[test]
     fn env_lines() {
@@ -463,7 +462,6 @@ LOGNAME=evil
         assert!(matches!(errs[0].error, EntryError::BadTimezone(_)));
         let errs = Crontab::parse("RANDOM_DELAY=lots\n", Format::User).unwrap_err();
         assert!(matches!(errs[0].error, EntryError::BadRandomDelay(_)));
-        let _ = NaiveDate::from_ymd_opt(2026, 1, 1);
     }
 
     #[test]

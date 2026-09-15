@@ -32,7 +32,8 @@ its path is printed ("edits left in ...") so you don't lose the changes.
 ### `crond`
 
 ```
--n / -f   foreground (log to stderr as well as syslog)
+-n / -f   foreground (also log to stderr, unless stderr is the systemd journal
+          and syslog is reachable)
 -p        permit any crontab (skip ownership/mode checks)
 -s        send job output to syslog instead of mail
 -m CMD    mail command reading an RFC 822 message on stdin, or "off"
@@ -52,23 +53,61 @@ the daemon. It keeps a lock and pid file at `/run/crond.pid`, and logs to
 syslog under the `cron` facility.
 
 `--run-at` rejects an unparsable time with "bad --run-at time" and a non-zero
-exit. It also exits non-zero if any job that was due could not be run, such
-as a system crontab entry naming a user that does not exist. A normal run
-where every due job started, or where no job was due, exits zero.
+exit. It also exits non-zero if any job that was due could not be run, for
+example because the daemon is not root and the job belongs to another user, or
+the job's user does not exist. A normal run where every due job started, or
+where no job was due, exits zero.
 
 ## Crontab syntax supported
 
-- Five time fields: numbers, ranges, lists, and steps (`*/15`, `1-10/3`, `5/20`).
-  Month and weekday names are accepted, and `7` means Sunday.
-- cronie's random ranges: `~`, `10~20`, `0~59/10`.
+- Five time fields: numbers, ranges, lists, and steps (`*/15`, `1-10/3`).
+  A step may only follow `*` or a range. A step larger than its range is
+  accepted with cronie's warning. A reversed range such as `5-3` selects nothing.
+  Numbers follow C `int` conversion, as in cronie.
+  Month and weekday names are the three-letter abbreviations in any case, and
+  `7` means Sunday.
+- cronie's random ranges: `~`, `~30`, `10~20`. A random range takes no step,
+  and only the value it picks must be in range.
 - Shortcuts: `@reboot @yearly @annually @monthly @weekly @daily @midnight @hourly`.
 - Classic day-of-month / day-of-week OR rule when both fields are restricted.
 - `%` sends the rest of the line to stdin, and `\%` gives a literal `%`.
-- `-n` mails output only on failure. `-q` skips logging the job start.
+- `-n` mails output only on failure, and may appear once. A `-` before the time
+  fields hides the job from the log. Only system crontabs and root may use it.
 - Environment lines, including quoted values. `LOGNAME` and `USER` are protected.
   `SHELL`, `PATH` and `HOME` can be overridden.
 - `MAILTO` (empty disables mail), `MAILFROM`, `CONTENT_TYPE`.
-- `CRON_TZ` per entry, and `RANDOM_DELAY` per file.
+- `CRON_TZ` and `RANDOM_DELAY` apply to the entries after them. `CRON_TZ` is
+  resolved like glibc's `TZ`: zone names, zoneinfo paths and POSIX strings with
+  DST rules all work, and an unknown value means UTC. An empty `CRON_TZ` means
+  the daemon's local time. Jobs with `CRON_TZ` set, even to an empty value, are
+  skipped while the local UTC offset is changing, as in cronie.
+- Only `crond` reads zone files, never `crontab`. Zones are cached by file
+  identity and rechecked on every use, so tzdata updates apply at once. FIFOs,
+  devices and files over 1 MiB are treated as unreadable without being opened
+  for reading, and set-ID programs get glibc's path restrictions.
+- `RANDOM_DELAY` makes a job run that many minutes (scaled by a random factor
+  chosen at startup) after its scheduled time, as cronie does. An out-of-range
+  value is logged by the daemon and ignored.
+- `LANG`, `LC_*`, `LANGUAGE`, `RANDOM_DELAY` and `MAILFROM` are inherited from
+  the environment of `crond` (or `crontab`) before the file's own lines.
+- `@` shortcuts are case-sensitive. Environment lines follow cronie's parser,
+  so names such as `1FOO` are valid.
+- `crond` skips a line with an error and logs it, and runs the rest of the
+  crontab. A job naming an unknown user is skipped when it is due, with
+  cronie's "getpwnam() failed - user unknown" message. `crontab` refuses to
+  install a file with an error and stops at the first one, printing any
+  earlier warnings.
+- A `*` right after the time fields is a bad command, commands keep trailing
+  spaces, and the last line must end with a newline.
+- Crontabs need not be UTF-8. Commands, variables and input keep their exact
+  bytes.
+- cronie's limits apply: 1000 variables, 10000 entries, 32768 characters of
+  comments and blank space between lines, and 131072-byte fields. `crontab`
+  refuses a file over them and `crond` does not load such a user crontab.
+- `-u` requires root, even for your own name. As in cronie, it is refused after
+  `-T`, `-n` or `-c`, while `-n` and `-c` after `-u` are refused only for another
+  user; `-u` before `-T` checks the file as that user. Without a file argument, `crontab` refuses to read a new
+  crontab from a terminal.
 - System crontab user field. `cron.d` skips `*.rpmsave`, `*.pacnew`, `*~` and
   other package-manager leftovers.
 
@@ -78,8 +117,15 @@ where every due job started, or where no job was due, exits zero.
   session, with `HOME` as the working directory. Each job gets a clean
   environment: `SHELL`, `PATH`, `HOME`, `LOGNAME` and `USER`, plus crontab
   variables.
-- Stdout and stderr are combined and mailed with sendmail (auto-detected) or
-  the `-m` command. With no mailer, output is logged as `CMDOUT`.
+- Stdout and stderr are combined and mailed through `/usr/sbin/sendmail` or the
+  `-m` command, with cronie's headers. `-s`, or no sendmail installed, logs each
+  output line as `CMDOUT` instead; `-m off` discards output. `$NAME` and
+  `${NAME}` in `MAILTO` and `MAILFROM` expand from crond's own environment. An
+  unsafe `MAILTO` sends no mail, and an unsafe `MAILFROM` falls back to the
+  account name.
+- Jobs start in the job environment's `HOME`, which a crontab may set, and are
+  skipped if that directory can't be entered. `CMD` and `CMDEND` log lines show
+  the command without its `%` input, escaped as cronie does.
 - Clock handling follows Vixie cron. Gaps of up to 5 minutes are replayed. When
   the clock jumps forward by up to 3 hours, such as at DST start, fixed-time jobs
   run once and wildcard jobs run for the current minute. When the clock goes back

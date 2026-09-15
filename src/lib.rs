@@ -2,7 +2,7 @@
 //! crontab management utility (`crontab`).
 //!
 //! The documented, semver-stable API of this crate is limited to the
-//! [`crontab`] and [`schedule`] modules (re-exported below as
+//! [`crontab`], [`schedule`] and [`tz`] modules (re-exported below as
 //! [`Crontab`], [`Entry`], [`Format`] and [`Schedule`]). Every other
 //! module is an implementation detail shared with the `crond` and
 //! `crontab` binaries bundled in this crate; it is hidden from the
@@ -10,12 +10,15 @@
 
 pub mod crontab;
 pub mod schedule;
+pub mod tz;
 
 // Implementation details shared with the bundled `crond`/`crontab` binaries
 // (which are separate crates and need access to these modules). Not part of
 // the public API: not covered by semver, and hidden from generated docs.
 #[doc(hidden)]
 pub mod allow;
+#[doc(hidden)]
+pub mod cli;
 #[doc(hidden)]
 pub mod clock;
 #[doc(hidden)]

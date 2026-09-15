@@ -56,12 +56,33 @@ fn connect(ident: &str) -> Option<syslog::Logger<LoggerBackend, Formatter3164>> 
     syslog::unix(formatter).ok()
 }
 
+/// True when stderr is connected to the systemd journal, which systemd
+/// advertises as `JOURNAL_STREAM=<device>:<inode>`. Mirroring log lines to
+/// stderr there would record every message twice.
+fn stderr_is_journal() -> bool {
+    let Ok(stream) = std::env::var("JOURNAL_STREAM") else {
+        return false;
+    };
+    let Some((dev, ino)) = stream.split_once(':') else {
+        return false;
+    };
+    let (Ok(dev), Ok(ino)) = (dev.parse::<u64>(), ino.parse::<u64>()) else {
+        return false;
+    };
+    // SAFETY: fstat on fd 2 with a zeroed, correctly sized stat buffer.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(2, &mut st) } != 0 {
+        return false;
+    }
+    st.st_dev as u64 == dev && st.st_ino as u64 == ino
+}
+
 /// Install the global logger.  `stderr` mirrors messages to standard error
 /// (used in foreground mode and by the `crontab` command for errors).
 pub fn init(ident: &str, stderr: bool, debug: bool) {
     let logger = CronLogger {
         syslog: Mutex::new(connect(ident)),
-        stderr,
+        stderr: stderr && !stderr_is_journal(),
         ident: ident.to_string(),
     };
     if log::set_boxed_logger(Box::new(logger)).is_ok() {

@@ -59,7 +59,19 @@ struct Cli {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            // cronie exits 1 on usage errors; help and version exit 0.
+            let _ = e.print();
+            return match e.kind() {
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => {
+                    ExitCode::SUCCESS
+                }
+                _ => ExitCode::FAILURE,
+            };
+        }
+    };
     let foreground = cli.foreground || cli.foreground_f || cli.run_at.is_some();
     let cfg = Config::from_env();
     let _ = cli.no_inotify;

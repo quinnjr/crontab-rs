@@ -1,23 +1,30 @@
-//! Cron time-specification parsing and matching with Vixie/cronie semantics.
+//! Cron time-specification parsing and matching, following cronie 1.7.
 //!
 //! A schedule has five fields (minute, hour, day-of-month, month, day-of-week)
 //! or one of the `@reboot`, `@yearly`, `@annually`, `@monthly`, `@weekly`,
-//! `@daily`, `@midnight`, `@hourly` shortcuts.
+//! `@daily`, `@midnight`, `@hourly` shortcuts. Shortcut names are
+//! case-sensitive.
 //!
-//! Field grammar (each field is a comma-separated list of ranges):
+//! Field grammar, ported from cronie's `get_list`/`get_range`:
 //!
 //! ```text
-//! range  := '*' | value | value '-' value | [value] '~' [value]
-//!           followed optionally by '/' step
-//! value  := number | name (months and weekdays, 3-letter prefixes accepted)
+//! list   := range {"," range}
+//! range  := "*" ["/" step]
+//!         | number ["-" number ["/" step]]
+//!         | [number] "~" [number]
+//! number := digits | name
 //! ```
 //!
-//! `~` picks a random value in the range once, at parse time (cronie
-//! extension).  `value/step` is treated as `value-max/step`.
+//! * Names are the exact three-letter month or weekday abbreviations,
+//!   matched case-insensitively.
+//! * A step may only follow `*` or a `a-b` range. A step larger than the
+//!   range is accepted with a warning.
+//! * A reversed range such as `5-3` is accepted but selects no values.
+//! * `~` picks one random value in the range when the crontab is loaded.
+//! * Day-of-week `7` is Sunday.
 //!
-//! Day-of-month and day-of-week follow the classic rule: if both fields are
-//! restricted (neither begins with `*`), a time matches when *either* field
-//! matches; otherwise both must match.
+//! Day-of-month and day-of-week follow the classic rule: when either field
+//! starts with `*`, both must match; otherwise either may match.
 
 use std::fmt;
 
@@ -60,43 +67,26 @@ enum Field {
     DayOfWeek,
 }
 
+const MONTH_NAMES: &[&str] = &[
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+const DOW_NAMES: &[&str] = &["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
 impl Field {
-    fn bounds(self) -> (u32, u32) {
+    fn bounds(self) -> (i64, i64) {
         match self {
             Field::Minute => (0, 59),
             Field::Hour => (0, 23),
             Field::DayOfMonth => (1, 31),
             Field::Month => (1, 12),
-            // 7 is accepted as an alias for Sunday and folded to 0.
             Field::DayOfWeek => (0, 7),
         }
     }
 
     fn names(self) -> Option<&'static [&'static str]> {
         match self {
-            Field::Month => Some(&[
-                "january",
-                "february",
-                "march",
-                "april",
-                "may",
-                "june",
-                "july",
-                "august",
-                "september",
-                "october",
-                "november",
-                "december",
-            ]),
-            Field::DayOfWeek => Some(&[
-                "sunday",
-                "monday",
-                "tuesday",
-                "wednesday",
-                "thursday",
-                "friday",
-                "saturday",
-            ]),
+            Field::Month => Some(MONTH_NAMES),
+            Field::DayOfWeek => Some(DOW_NAMES),
             _ => None,
         }
     }
@@ -132,10 +122,23 @@ pub struct Schedule {
 impl Schedule {
     /// Parse the time specification at the start of `line`.
     ///
-    /// Returns the schedule and the remainder of the line (leading whitespace
-    /// removed), which holds the user and/or command.
+    /// Returns the schedule and the remainder of the line (leading blanks
+    /// removed), which holds the user and/or command. Warnings are dropped;
+    /// use [`parse_prefix_with_warnings`](Self::parse_prefix_with_warnings)
+    /// to see them.
     pub fn parse_prefix(line: &str) -> Result<(Schedule, &str), ScheduleError> {
-        Self::parse_prefix_with(line, &mut rand::rng())
+        let mut warnings = Vec::new();
+        Self::parse_impl(line, &mut rand::rng(), &mut warnings)
+    }
+
+    /// Like [`parse_prefix`](Self::parse_prefix), also returning warnings
+    /// such as cronie's "Step size N higher than possible maximum of M".
+    pub fn parse_prefix_with_warnings(
+        line: &str,
+    ) -> Result<(Schedule, &str, Vec<String>), ScheduleError> {
+        let mut warnings = Vec::new();
+        let (s, rest) = Self::parse_impl(line, &mut rand::rng(), &mut warnings)?;
+        Ok((s, rest, warnings))
     }
 
     /// Like [`parse_prefix`](Self::parse_prefix) but with a caller-supplied
@@ -144,25 +147,8 @@ impl Schedule {
         line: &'a str,
         rng: &mut R,
     ) -> Result<(Schedule, &'a str), ScheduleError> {
-        let line = line.trim_start();
-        if let Some(rest) = line.strip_prefix('@') {
-            let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
-            let (name, remainder) = rest.split_at(end);
-            let spec = match name.to_ascii_lowercase().as_str() {
-                "reboot" => {
-                    return Ok((Schedule::reboot(), remainder.trim_start()));
-                }
-                "yearly" | "annually" => "0 0 1 1 *",
-                "monthly" => "0 0 1 * *",
-                "weekly" => "0 0 * * 0",
-                "daily" | "midnight" => "0 0 * * *",
-                "hourly" => "0 * * * *",
-                _ => return Err(ScheduleError::BadTimeSpecifier),
-            };
-            let (schedule, _) = Self::parse_fields(spec, rng)?;
-            return Ok((schedule, remainder.trim_start()));
-        }
-        Self::parse_fields(line, rng)
+        let mut warnings = Vec::new();
+        Self::parse_impl(line, rng, &mut warnings)
     }
 
     /// Parse a complete five-field specification (or `@shortcut`) with no
@@ -176,30 +162,54 @@ impl Schedule {
         }
     }
 
+    fn parse_impl<'a, R: Rng>(
+        line: &'a str,
+        rng: &mut R,
+        warnings: &mut Vec<String>,
+    ) -> Result<(Schedule, &'a str), ScheduleError> {
+        let line = trim_blanks(line);
+        if let Some(rest) = line.strip_prefix('@') {
+            let end = rest.find(is_blank).unwrap_or(rest.len());
+            let (name, remainder) = rest.split_at(end);
+            let spec = match name {
+                "reboot" => return Ok((Schedule::reboot(), trim_blanks(remainder))),
+                "yearly" | "annually" => "0 0 1 1 *",
+                "monthly" => "0 0 1 * *",
+                "weekly" => "0 0 * * 0",
+                "daily" | "midnight" => "0 0 * * *",
+                "hourly" => "0 * * * *",
+                _ => return Err(ScheduleError::BadTimeSpecifier),
+            };
+            let (schedule, _) = Self::parse_fields(spec, rng, warnings)?;
+            return Ok((schedule, trim_blanks(remainder)));
+        }
+        Self::parse_fields(line, rng, warnings)
+    }
+
     fn parse_fields<'a, R: Rng>(
         line: &'a str,
         rng: &mut R,
+        warnings: &mut Vec<String>,
     ) -> Result<(Schedule, &'a str), ScheduleError> {
-        let mut rest = line.trim_start();
+        let mut rest = trim_blanks(line);
         let mut next = |field: Field| -> Result<(u64, bool), ScheduleError> {
-            let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+            let end = rest.find(is_blank).unwrap_or(rest.len());
             let (token, remainder) = rest.split_at(end);
             if token.is_empty() {
                 return Err(field.error());
             }
-            rest = remainder.trim_start();
-            parse_field(token, field, rng)
+            rest = trim_blanks(remainder);
+            parse_list(token, field, rng, warnings)
         };
         let (minutes, minute_star) = next(Field::Minute)?;
         let (hours, hour_star) = next(Field::Hour)?;
         let (days_of_month, dom_star) = next(Field::DayOfMonth)?;
-        let (months, month_star) = next(Field::Month)?;
-        let _ = month_star;
+        let (months, _) = next(Field::Month)?;
         let (days_of_week, dow_star) = next(Field::DayOfWeek)?;
-        // Fold Sunday-as-7 onto bit 0.
-        let mut dow = days_of_week as u8;
+        // Day-of-week 0 and 7 are both Sunday.
+        let mut dow = (days_of_week & 0x7f) as u8;
         if days_of_week & (1 << 7) != 0 {
-            dow = (dow & 0x7f) | 1;
+            dow |= 1;
         }
         Ok((
             Schedule {
@@ -258,9 +268,8 @@ impl Schedule {
         minute_ok && hour_ok && month_ok && day_ok
     }
 
-    /// The classic Vixie day-of-month/day-of-week rule: if both fields are
-    /// restricted (neither started with `*`), a time matches when *either*
-    /// field matches; otherwise both must match.
+    /// cronie's day rule (`cron.c`): if either day field started with `*`,
+    /// both must match; otherwise either may match.
     fn day_matches(&self, day_of_month: u32, weekday_from_sunday: u32) -> bool {
         let dom_ok = self.days_of_month & (1u32 << day_of_month) != 0;
         let dow_ok = self.days_of_week & (1u8 << weekday_from_sunday) != 0;
@@ -284,7 +293,6 @@ impl Schedule {
             .checked_add_signed(chrono::Duration::minutes(1))?;
         while t <= limit {
             if self.months & (1u16 << t.month()) == 0 {
-                // Jump to the first minute of next month.
                 let (y, m) = if t.month() == 12 {
                     (t.year() + 1, 1)
                 } else {
@@ -293,8 +301,7 @@ impl Schedule {
                 t = chrono::NaiveDate::from_ymd_opt(y, m, 1)?.and_hms_opt(0, 0, 0)?;
                 continue;
             }
-            let day_ok = self.day_matches(t.day(), t.weekday().num_days_from_sunday());
-            if !day_ok {
+            if !self.day_matches(t.day(), t.weekday().num_days_from_sunday()) {
                 t = (t.date() + chrono::Duration::days(1)).and_hms_opt(0, 0, 0)?;
                 continue;
             }
@@ -314,124 +321,156 @@ impl Schedule {
     }
 }
 
-fn parse_field<R: Rng>(
+/// cronie separates fields with spaces and tabs only.
+fn is_blank(c: char) -> bool {
+    c == ' ' || c == '\t'
+}
+
+fn trim_blanks(s: &str) -> &str {
+    s.trim_start_matches(is_blank)
+}
+
+fn parse_list<R: Rng>(
     token: &str,
     field: Field,
     rng: &mut R,
+    warnings: &mut Vec<String>,
 ) -> Result<(u64, bool), ScheduleError> {
     let star = token.starts_with('*');
     let mut bits = 0u64;
     for part in token.split(',') {
-        if part.is_empty() {
-            return Err(field.error());
-        }
-        bits |= parse_range(part, field, rng)?;
+        bits |= parse_range(part, field, rng, warnings)?;
     }
     Ok((bits, star))
 }
 
-fn parse_range<R: Rng>(part: &str, field: Field, rng: &mut R) -> Result<u64, ScheduleError> {
-    let (min, max) = field.bounds();
-    let (base, step) = match part.split_once('/') {
-        Some((b, s)) => {
-            let step = parse_plain_number(s).ok_or(field.error())?;
-            if step == 0 || step > max - min + 1 {
-                return Err(field.error());
-            }
-            (b, Some(step))
-        }
-        None => (part, None),
-    };
-
-    let (low, high) = if base == "*" {
-        (min, max)
-    } else if let Some((lo, hi)) = base.split_once('~') {
-        let low = if lo.is_empty() {
-            min
-        } else {
-            parse_value(lo, field)?
-        };
-        let high = if hi.is_empty() {
-            max
-        } else {
-            parse_value(hi, field)?
-        };
-        if low > high {
-            return Err(field.error());
-        }
-        let chosen = rng.random_range(low..=high);
-        return match step {
-            None => Ok(1u64 << chosen),
-            Some(step) => {
-                // Random offset within the first step window, then stride.
-                let window_end = low
-                    .checked_add(step - 1)
-                    .map(|v| v.min(high))
-                    .unwrap_or(high);
-                let start = rng.random_range(low..=window_end);
-                Ok(bits_between(start, high, step))
-            }
-        };
-    } else if let Some((lo, hi)) = base.split_once('-') {
-        let low = parse_value(lo, field)?;
-        let high = parse_value(hi, field)?;
-        if low > high {
-            return Err(field.error());
-        }
-        (low, high)
-    } else {
-        let value = parse_value(base, field)?;
-        match step {
-            None => return Ok(1u64 << value),
-            Some(_) => (value, max),
-        }
-    };
-
-    Ok(bits_between(low, high, step.unwrap_or(1)))
+/// Split off the leading run of ASCII alphanumerics (cronie's `get_number`
+/// reads exactly this much).
+fn take_alnum(s: &str) -> (&str, &str) {
+    let end = s
+        .find(|c: char| !c.is_ascii_alphanumeric())
+        .unwrap_or(s.len());
+    s.split_at(end)
 }
 
-fn bits_between(low: u32, high: u32, step: u32) -> u64 {
-    let mut bits = 0u64;
-    let mut v = low;
-    loop {
-        if v > high {
-            break;
-        }
-        bits |= 1u64 << v;
-        match v.checked_add(step) {
-            Some(next) => v = next,
-            None => break,
-        }
-    }
-    bits
-}
-
-fn parse_plain_number(s: &str) -> Option<u32> {
-    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    s.parse().ok()
-}
-
-fn parse_value(s: &str, field: Field) -> Result<u32, ScheduleError> {
-    let (min, max) = field.bounds();
-    if let Some(n) = parse_plain_number(s) {
-        if n < min || n > max {
-            return Err(field.error());
-        }
-        return Ok(n);
-    }
-    let names = field.names().ok_or(field.error())?;
-    if s.len() < 3 || !s.bytes().all(|b| b.is_ascii_alphabetic()) {
+/// cronie's `get_number`: a decimal number, or an exact (case-insensitive)
+/// three-letter name for fields that have names.
+fn get_number(token: &str, field: Field) -> Result<i64, ScheduleError> {
+    if token.is_empty() {
         return Err(field.error());
     }
-    let lower = s.to_ascii_lowercase();
-    for (i, name) in names.iter().enumerate() {
-        if name.starts_with(&lower) {
-            return Ok(min + i as u32);
-        }
+    if token.bytes().all(|b| b.is_ascii_digit()) {
+        // Saturate absurdly long numbers; they fail the bounds check later.
+        return Ok(token.parse::<i64>().unwrap_or(i64::MAX / 2));
     }
-    Err(field.error())
+    let (low, _) = field.bounds();
+    field
+        .names()
+        .and_then(|names| names.iter().position(|n| n.eq_ignore_ascii_case(token)))
+        .map(|i| low + i as i64)
+        .ok_or(field.error())
+}
+
+/// A step: digits only, non-zero, and nothing after it.
+fn get_step(s: &str, field: Field) -> Result<i64, ScheduleError> {
+    let (token, rest) = take_alnum(s);
+    if token.is_empty() || !rest.is_empty() || !token.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(field.error());
+    }
+    match token.parse::<u32>() {
+        Ok(0) | Err(_) => Err(field.error()),
+        Ok(step) => Ok(step as i64),
+    }
+}
+
+fn parse_range<R: Rng>(
+    part: &str,
+    field: Field,
+    rng: &mut R,
+    warnings: &mut Vec<String>,
+) -> Result<u64, ScheduleError> {
+    let (low, high) = field.bounds();
+    let err = field.error();
+
+    let (first, step) = if let Some(rest) = part.strip_prefix('*') {
+        // "*" ["/" step]
+        let step = match rest {
+            "" => 1,
+            _ => match rest.strip_prefix('/') {
+                Some(s) => get_step(s, field)?,
+                None => return Err(err),
+            },
+        };
+        ((low, high), step)
+    } else if let Some(rest) = part.strip_prefix('~') {
+        // "~" [number]
+        return random_value(low, rest, field, rng);
+    } else {
+        let (tok1, after) = take_alnum(part);
+        let a = get_number(tok1, field)?;
+        if after.is_empty() {
+            ((a, a), 1)
+        } else if let Some(r) = after.strip_prefix('-') {
+            // number "-" number ["/" step]
+            let (tok2, after2) = take_alnum(r);
+            let b = get_number(tok2, field)?;
+            let step = match after2 {
+                "" => 1,
+                _ => match after2.strip_prefix('/') {
+                    Some(s) => get_step(s, field)?,
+                    None => return Err(err),
+                },
+            };
+            ((a, b), step)
+        } else if let Some(r) = after.strip_prefix('~') {
+            // number "~" [number]
+            return random_value(a, r, field, rng);
+        } else {
+            return Err(err);
+        }
+    };
+
+    let (lo, hi) = first;
+    if step > 1 && step > hi - lo {
+        let max = if hi - lo > 0 { hi - lo } else { 1 };
+        warnings.push(format!(
+            "Warning: Step size {step} higher than possible maximum of {max}"
+        ));
+    }
+    let mut bits = 0u64;
+    let mut i = lo;
+    while i <= hi {
+        // cronie's set_element: every selected value must be in range.
+        if i < low || i > high {
+            return Err(err);
+        }
+        bits |= 1u64 << i;
+        i += step;
+    }
+    Ok(bits)
+}
+
+/// `[a] "~" [b]`: one random value in `a..=b`, chosen at parse time.
+fn random_value<R: Rng>(
+    start: i64,
+    rest: &str,
+    field: Field,
+    rng: &mut R,
+) -> Result<u64, ScheduleError> {
+    let (low, high) = field.bounds();
+    let end = if rest.is_empty() {
+        high
+    } else {
+        let (tok, after) = take_alnum(rest);
+        if !after.is_empty() {
+            return Err(field.error());
+        }
+        get_number(tok, field)?
+    };
+    if start > end || start < low || end > high {
+        return Err(field.error());
+    }
+    Ok(1u64 << rng.random_range(start..=end))
 }
 
 #[cfg(test)]
@@ -448,6 +487,12 @@ mod tests {
 
     fn sched(s: &str) -> Schedule {
         Schedule::parse(s).unwrap_or_else(|e| panic!("{s}: {e}"))
+    }
+
+    fn minutes_fired(s: &Schedule) -> Vec<u32> {
+        (0..60)
+            .filter(|m| s.matches(&at(2026, 1, 1, 0, *m)))
+            .collect()
     }
 
     #[test]
@@ -475,38 +520,118 @@ mod tests {
         assert!(!s.matches(&at(2026, 9, 14, 18, 0)));
 
         let s = sched("*/15 */2 * * *");
-        assert!(s.matches(&at(2026, 1, 1, 0, 0)));
         assert!(s.matches(&at(2026, 1, 1, 4, 45)));
         assert!(!s.matches(&at(2026, 1, 1, 3, 0)));
-        assert!(!s.matches(&at(2026, 1, 1, 4, 10)));
         assert!(s.is_wild());
 
-        let s = sched("5/20 * * * *");
-        for m in [5, 25, 45] {
-            assert!(s.matches(&at(2026, 1, 1, 0, m)), "{m}");
-        }
-        assert!(!s.matches(&at(2026, 1, 1, 0, 0)));
-
-        let s = sched("1-10/3 * * * *");
-        for m in [1, 4, 7, 10] {
-            assert!(s.matches(&at(2026, 1, 1, 0, m)), "{m}");
-        }
-        assert!(!s.matches(&at(2026, 1, 1, 0, 13)));
+        assert_eq!(minutes_fired(&sched("1-10/3 * * * *")), vec![1, 4, 7, 10]);
+        assert_eq!(
+            minutes_fired(&sched("1-5,50-59/4 * * * *")),
+            vec![1, 2, 3, 4, 5, 50, 54, 58]
+        );
+        assert_eq!(minutes_fired(&sched("007 * * * *")), vec![7]);
     }
 
     #[test]
-    fn names() {
-        let s = sched("0 0 * jan,MAR,december mon-Fri");
+    fn step_only_after_star_or_range() {
+        // cronie rejects "number/step".
+        assert_eq!(
+            Schedule::parse("5/10 * * * *"),
+            Err(ScheduleError::BadMinute)
+        );
+        assert_eq!(
+            Schedule::parse("0 0 * * 1/2"),
+            Err(ScheduleError::BadDayOfWeek)
+        );
+        assert_eq!(Schedule::parse("*/ * * * *"), Err(ScheduleError::BadMinute));
+        assert_eq!(
+            Schedule::parse("*/5x * * * *"),
+            Err(ScheduleError::BadMinute)
+        );
+        assert_eq!(Schedule::parse("*5 * * * *"), Err(ScheduleError::BadMinute));
+        assert_eq!(
+            Schedule::parse("*/0 * * * *"),
+            Err(ScheduleError::BadMinute)
+        );
+    }
+
+    #[test]
+    fn oversized_steps_warn_but_parse() {
+        let (s, _, w) = Schedule::parse_prefix_with_warnings("*/61 * * * *").unwrap();
+        assert_eq!(minutes_fired(&s), vec![0]);
+        assert_eq!(
+            w,
+            vec!["Warning: Step size 61 higher than possible maximum of 59"]
+        );
+
+        let (s, _, w) = Schedule::parse_prefix_with_warnings("10-59/61 * * * *").unwrap();
+        assert_eq!(minutes_fired(&s), vec![10]);
+        assert_eq!(w.len(), 1);
+
+        let (s, _, w) = Schedule::parse_prefix_with_warnings("*/4294967290 * * * *").unwrap();
+        assert_eq!(minutes_fired(&s), vec![0]);
+        assert_eq!(w.len(), 1);
+
+        // Equal to the span: a warning in cronie too (60 > 59).
+        let (_, _, w) = Schedule::parse_prefix_with_warnings("0-59/60 * * * *").unwrap();
+        assert_eq!(w.len(), 1);
+        let (_, _, w) = Schedule::parse_prefix_with_warnings("0-59/59 * * * *").unwrap();
+        assert!(w.is_empty());
+        let (_, _, w) = Schedule::parse_prefix_with_warnings("*/15 * * * *").unwrap();
+        assert!(w.is_empty());
+    }
+
+    #[test]
+    fn reversed_ranges_select_nothing() {
+        assert!(minutes_fired(&sched("5-3 * * * *")).is_empty());
+        assert!(minutes_fired(&sched("99-3 * * * *")).is_empty());
+        let s = sched("0 0 * * sat-sun");
+        for d in 1..=31 {
+            assert!(!s.matches(&at(2026, 1, d, 0, 0)), "day {d}");
+        }
+        let s = sched("0 0 * * sun-sat");
+        assert!((1..=7).all(|d| s.matches(&at(2026, 9, d, 0, 0))));
+        // Out-of-range values that would actually be selected still fail.
+        assert_eq!(
+            Schedule::parse("70-80 * * * *"),
+            Err(ScheduleError::BadMinute)
+        );
+        assert_eq!(
+            Schedule::parse("58-61 * * * *"),
+            Err(ScheduleError::BadMinute)
+        );
+    }
+
+    #[test]
+    fn names_are_exact_abbreviations() {
+        let s = sched("0 0 * jan,MAR,Dec mon-Fri");
         assert!(s.matches(&at(2026, 1, 5, 0, 0)));
         assert!(s.matches(&at(2026, 3, 2, 0, 0)));
         assert!(s.matches(&at(2026, 12, 7, 0, 0)));
         assert!(!s.matches(&at(2026, 2, 2, 0, 0)));
         assert!(!s.matches(&at(2026, 1, 4, 0, 0))); // Sunday
         assert_eq!(
+            Schedule::parse("0 0 * * monday"),
+            Err(ScheduleError::BadDayOfWeek)
+        );
+        assert_eq!(
+            Schedule::parse("0 0 * JANUARY *"),
+            Err(ScheduleError::BadMonth)
+        );
+        assert_eq!(
+            Schedule::parse("0 0 * * mo"),
+            Err(ScheduleError::BadDayOfWeek)
+        );
+        assert_eq!(
             Schedule::parse("0 0 * * foo"),
             Err(ScheduleError::BadDayOfWeek)
         );
         assert_eq!(Schedule::parse("0 0 * xyz *"), Err(ScheduleError::BadMonth));
+        assert_eq!(
+            Schedule::parse("jan * * * *"),
+            Err(ScheduleError::BadMinute)
+        );
+        assert_eq!(Schedule::parse("1a * * * *"), Err(ScheduleError::BadMinute));
     }
 
     #[test]
@@ -520,39 +645,39 @@ mod tests {
     }
 
     #[test]
-    fn dom_dow_or_semantics() {
-        // Both restricted: fires on the 13th OR on Fridays.
+    fn dom_dow_rule_matches_cron_c() {
+        // Both restricted: the 13th OR Fridays.
         let s = sched("0 0 13 * 5");
-        assert!(s.matches(&at(2026, 9, 13, 0, 0))); // 13th (Sunday)
-        assert!(s.matches(&at(2026, 9, 11, 0, 0))); // Friday 11th
+        assert!(s.matches(&at(2026, 9, 13, 0, 0)));
+        assert!(s.matches(&at(2026, 9, 11, 0, 0)));
         assert!(!s.matches(&at(2026, 9, 14, 0, 0)));
-
-        // dom is `*/2` -> star flag set -> AND semantics.
+        // Day-of-month starts with '*': both must match.
         let s = sched("0 0 */2 * 5");
         assert!(!s.matches(&at(2026, 9, 13, 0, 0)));
-        assert!(s.matches(&at(2026, 9, 11, 0, 0))); // Friday, odd day 11
-        assert!(!s.matches(&at(2026, 9, 18, 0, 0))); // Friday, even day 18
+        assert!(s.matches(&at(2026, 9, 11, 0, 0)));
+        assert!(!s.matches(&at(2026, 9, 18, 0, 0)));
     }
 
     #[test]
-    fn shortcuts() {
+    fn shortcuts_are_case_sensitive() {
         assert!(sched("@hourly").matches(&at(2026, 5, 5, 7, 0)));
         assert!(!sched("@hourly").matches(&at(2026, 5, 5, 7, 1)));
+        assert!(sched("@hourly").is_wild());
         assert!(sched("@daily").matches(&at(2026, 5, 5, 0, 0)));
         assert!(sched("@midnight").matches(&at(2026, 5, 5, 0, 0)));
         assert!(sched("@weekly").matches(&at(2026, 9, 13, 0, 0)));
         assert!(!sched("@weekly").matches(&at(2026, 9, 14, 0, 0)));
         assert!(sched("@monthly").matches(&at(2026, 9, 1, 0, 0)));
         assert!(sched("@yearly").matches(&at(2026, 1, 1, 0, 0)));
-        assert!(sched("@ANNUALLY").matches(&at(2026, 1, 1, 0, 0)));
-        assert!(!sched("@yearly").matches(&at(2026, 2, 1, 0, 0)));
-        let r = sched("@reboot");
-        assert!(r.is_reboot());
-        assert!(!r.matches(&at(2026, 1, 1, 0, 0)));
-        assert_eq!(
-            Schedule::parse("@bogus"),
-            Err(ScheduleError::BadTimeSpecifier)
-        );
+        assert!(sched("@annually").matches(&at(2026, 1, 1, 0, 0)));
+        assert!(sched("@reboot").is_reboot());
+        for bad in ["@HOURLY", "@Daily", "@ANNUALLY", "@bogus", "@every"] {
+            assert_eq!(
+                Schedule::parse(bad),
+                Err(ScheduleError::BadTimeSpecifier),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
@@ -582,43 +707,24 @@ mod tests {
             Err(ScheduleError::BadDayOfWeek)
         );
         assert_eq!(
-            Schedule::parse("*/0 * * * *"),
-            Err(ScheduleError::BadMinute)
-        );
-        assert_eq!(
-            Schedule::parse("5-3 * * * *"),
-            Err(ScheduleError::BadMinute)
-        );
-        assert_eq!(
             Schedule::parse("1,,2 * * * *"),
             Err(ScheduleError::BadMinute)
         );
+        assert_eq!(Schedule::parse(",1 * * * *"), Err(ScheduleError::BadMinute));
+        assert_eq!(Schedule::parse("-1 * * * *"), Err(ScheduleError::BadMinute));
         assert_eq!(Schedule::parse("* * * *"), Err(ScheduleError::BadDayOfWeek));
         assert_eq!(
             Schedule::parse("* * * * * extra"),
             Err(ScheduleError::BadTimeSpecifier)
         );
         assert_eq!(Schedule::parse("a * * * *"), Err(ScheduleError::BadMinute));
-    }
-
-    #[test]
-    fn step_bounds() {
         assert_eq!(
-            Schedule::parse("*/4294967290 * * * *"),
-            Err(ScheduleError::BadMinute)
+            Schedule::parse("0 0 L * *"),
+            Err(ScheduleError::BadDayOfMonth)
         );
         assert_eq!(
-            Schedule::parse("10-59/61 * * * *"),
-            Err(ScheduleError::BadMinute)
-        );
-        let s = sched("*/60 * * * *");
-        let fired: Vec<u32> = (0..60)
-            .filter(|m| s.matches(&at(2026, 1, 1, 0, *m)))
-            .collect();
-        assert_eq!(fired, vec![0]);
-        assert_eq!(
-            Schedule::parse("0~59/4294967295 * * * *"),
-            Err(ScheduleError::BadMinute)
+            Schedule::parse("0 0 * * 5#3"),
+            Err(ScheduleError::BadDayOfWeek)
         );
     }
 
@@ -628,31 +734,31 @@ mod tests {
         let mut rng = rand::rngs::StdRng::seed_from_u64(7);
         for _ in 0..50 {
             let (s, _) = Schedule::parse_prefix_with("10~20 * * * *", &mut rng).unwrap();
-            let fired: Vec<u32> = (0..60)
-                .filter(|m| s.matches(&at(2026, 1, 1, 0, *m)))
-                .collect();
+            let fired = minutes_fired(&s);
             assert_eq!(fired.len(), 1);
             assert!((10..=20).contains(&fired[0]));
         }
         let (s, _) = Schedule::parse_prefix_with("~ ~ * * *", &mut rng).unwrap();
-        let fired = (0..60)
-            .filter(|m| s.matches(&at(2026, 1, 1, 0, *m)))
-            .count();
-        assert!(fired <= 1);
+        assert!(minutes_fired(&s).len() <= 1);
         assert!(!s.is_wild());
+        let (s, _) = Schedule::parse_prefix_with("~5 * * * *", &mut rng).unwrap();
+        assert!(minutes_fired(&s)[0] <= 5);
+        let (s, _) = Schedule::parse_prefix_with("0 0 * * mon~fri", &mut rng).unwrap();
+        assert!((1..=7).any(|d| s.matches(&at(2026, 9, d, 0, 0))));
 
-        let (s, _) = Schedule::parse_prefix_with("0~59/10 * * * *", &mut rng).unwrap();
-        let fired: Vec<u32> = (0..60)
-            .filter(|m| s.matches(&at(2026, 1, 1, 0, *m)))
-            .collect();
-        assert_eq!(fired.len(), 6, "{fired:?}");
-        assert!(fired[0] < 10);
-        assert!(fired.windows(2).all(|w| w[1] - w[0] == 10));
-
-        assert_eq!(
-            Schedule::parse_prefix_with("20~10 * * * *", &mut rng).map(|_| ()),
-            Err(ScheduleError::BadMinute)
-        );
+        for bad in [
+            "20~10 * * * *",
+            "0~59/10 * * * *",
+            "~/5 * * * *",
+            "10~99 * * * *",
+            "1~2~3 * * * *",
+        ] {
+            assert_eq!(
+                Schedule::parse_prefix_with(bad, &mut rng).map(|_| ()),
+                Err(ScheduleError::BadMinute),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
@@ -679,5 +785,9 @@ mod tests {
             Some(at(2027, 1, 1, 0, 0))
         );
         assert_eq!(sched("@reboot").next_after(&at(2026, 1, 1, 0, 0), 5), None);
+        assert_eq!(
+            sched("5-3 * * * *").next_after(&at(2026, 1, 1, 0, 0), 1),
+            None
+        );
     }
 }

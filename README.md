@@ -32,7 +32,7 @@ its path is printed ("edits left in ...") so you don't lose the changes.
 ### `crond`
 
 ```
--n / -f   foreground (log to stderr as well as syslog)
+-n / -f   foreground (also log to stderr, unless stderr is the systemd journal)
 -p        permit any crontab (skip ownership/mode checks)
 -s        send job output to syslog instead of mail
 -m CMD    mail command reading an RFC 822 message on stdin, or "off"
@@ -52,23 +52,34 @@ the daemon. It keeps a lock and pid file at `/run/crond.pid`, and logs to
 syslog under the `cron` facility.
 
 `--run-at` rejects an unparsable time with "bad --run-at time" and a non-zero
-exit. It also exits non-zero if any job that was due could not be run, such
-as a system crontab entry naming a user that does not exist. A normal run
-where every due job started, or where no job was due, exits zero.
+exit. It also exits non-zero if any job that was due could not be run, for
+example because the daemon is not root and the job belongs to another user.
+A system crontab naming an unknown user is rejected when it loads, so its jobs
+never become due. A normal run where every due job started, or where no job
+was due, exits zero.
 
 ## Crontab syntax supported
 
-- Five time fields: numbers, ranges, lists, and steps (`*/15`, `1-10/3`, `5/20`).
-  Month and weekday names are accepted, and `7` means Sunday.
-- cronie's random ranges: `~`, `10~20`, `0~59/10`.
+- Five time fields: numbers, ranges, lists, and steps (`*/15`, `1-10/3`).
+  A step may only follow `*` or a range. A step larger than its range is
+  accepted with cronie's warning. A reversed range such as `5-3` selects nothing.
+  Month and weekday names are the three-letter abbreviations in any case, and
+  `7` means Sunday.
+- cronie's random ranges: `~`, `~30`, `10~20`. A random range takes no step.
 - Shortcuts: `@reboot @yearly @annually @monthly @weekly @daily @midnight @hourly`.
 - Classic day-of-month / day-of-week OR rule when both fields are restricted.
 - `%` sends the rest of the line to stdin, and `\%` gives a literal `%`.
-- `-n` mails output only on failure. `-q` skips logging the job start.
+- `-n` mails output only on failure, and may appear once. A `-` before the time
+  fields hides the job from the log. Only system crontabs and root may use it.
 - Environment lines, including quoted values. `LOGNAME` and `USER` are protected.
   `SHELL`, `PATH` and `HOME` can be overridden.
 - `MAILTO` (empty disables mail), `MAILFROM`, `CONTENT_TYPE`.
-- `CRON_TZ` per entry, and `RANDOM_DELAY` per file.
+- `CRON_TZ` and `RANDOM_DELAY` apply to the entries after them. An unknown or
+  empty `CRON_TZ` means UTC, as with glibc. An out-of-range `RANDOM_DELAY` is
+  logged by the daemon and ignored.
+- `@` shortcuts are case-sensitive. Environment lines follow cronie's parser,
+  so names such as `1FOO` are valid.
+- A system crontab that names an unknown user is rejected as a whole.
 - System crontab user field. `cron.d` skips `*.rpmsave`, `*.pacnew`, `*~` and
   other package-manager leftovers.
 

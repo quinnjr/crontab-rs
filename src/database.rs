@@ -39,9 +39,9 @@ pub struct LoadedTab {
     /// For spool crontabs, the owning user (who runs every entry).
     pub owner: Option<String>,
     pub crontab: Crontab,
-    /// Delay in minutes applied to every job in this file (derived from
-    /// `RANDOM_DELAY` and the daemon's random scale).
-    pub delay: u32,
+    /// Per-entry delay in minutes, aligned with `crontab.entries`: each
+    /// entry's `RANDOM_DELAY` scaled by the daemon's random factor.
+    pub delays: Vec<u32>,
     /// Name used in log messages (user name or file path).
     pub label: String,
 }
@@ -313,9 +313,11 @@ impl Database {
                 }
             }
         }
+        let mut owner_uid: Option<u32> = None;
         if let Some(user) = &owner {
             match User::from_name(user) {
-                Ok(Some(_)) => {
+                Ok(Some(u)) => {
+                    owner_uid = Some(u.uid.as_raw());
                     self.orphan_logged.remove(path);
                 }
                 Ok(None) => {
@@ -345,12 +347,50 @@ impl Database {
                 return self.tabs.remove(path).is_some();
             }
         };
-        match Crontab::parse(&text, format) {
+        // cronie lets system crontabs and root hide jobs from the log.
+        let privileged = format == Format::System || owner_uid == Some(0);
+        match Crontab::parse_as(&text, format, privileged) {
             Ok(crontab) => {
-                let delay = crontab
-                    .random_delay
-                    .map(|max| (max as f64 * self.random_scale).round() as u32)
-                    .unwrap_or(0);
+                for w in &crontab.warnings {
+                    log::warn!("({label}) {} ({}:{})", w.message, path.display(), w.line);
+                }
+                // cronie rejects a system crontab naming an unknown user.
+                if format == Format::System {
+                    for entry in &crontab.entries {
+                        let Some(user) = entry.user.as_deref() else {
+                            continue;
+                        };
+                        match User::from_name(user) {
+                            Ok(Some(_)) => {}
+                            Ok(None) => {
+                                log::error!(
+                                    "({label}) BAD CRONTAB ({}): line {}: bad username",
+                                    path.display(),
+                                    entry.line
+                                );
+                                self.bad.insert(path.to_path_buf(), key);
+                                return self.tabs.remove(path).is_some();
+                            }
+                            Err(e) => {
+                                log::warn!("({label}) CAN'T LOOKUP USER ({e})");
+                                return false;
+                            }
+                        }
+                    }
+                }
+                let delays = crontab
+                    .entries
+                    .iter()
+                    .map(|e| match e.random_delay {
+                        Some(max) => (max as f64 * self.random_scale) as u32,
+                        None => {
+                            if crate::crontab::env_get(&e.env, "RANDOM_DELAY").is_some() {
+                                log::error!("({label}) ERROR (bad value of RANDOM_DELAY)");
+                            }
+                            0
+                        }
+                    })
+                    .collect();
                 let verb = if self.tabs.contains_key(path) {
                     "RELOAD"
                 } else {
@@ -368,7 +408,7 @@ impl Database {
                         format,
                         owner,
                         crontab,
-                        delay,
+                        delays,
                         label,
                     },
                 );
@@ -487,7 +527,7 @@ mod tests {
         assert!(db.refresh());
         let tab = &db.tabs[&spool];
         assert_eq!(tab.crontab.entries[0].command, "echo user2");
-        assert_eq!(tab.delay, 5);
+        assert_eq!(tab.delays, vec![5]);
         assert_eq!(tab.owner.as_deref(), Some(me().as_str()));
 
         // Break it: entry is unloaded, error logged once.

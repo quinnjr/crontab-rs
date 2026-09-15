@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Crontab parsing now follows cronie 1.7.2. A differential test against cronie's own parser found each of these differences:
+  - A step may only follow `*` or a range, so `5/10` is rejected.
+  - A step larger than its range is accepted with cronie's warning instead of being rejected.
+  - Reversed ranges such as `5-3` and `sat-sun` are accepted and select nothing.
+  - Month and weekday names must be the three-letter abbreviations. `@` shortcuts are case-sensitive.
+  - Random ranges no longer accept a step.
+  - Environment lines use a port of cronie's parser, so names such as `1FOO` are valid.
+  - A `CRON_TZ` value glibc does not recognise, or an empty one, means UTC instead of an error.
+  - `RANDOM_DELAY` uses cronie's parsing, applies to the entries after it, and is never a syntax error.
+- The `-q` job option is replaced by cronie's leading `-`, which hides a job from the log. Only system crontabs and root may use it. `-n` may appear only once.
+- A system crontab that names an unknown user is rejected as a whole, as in cronie.
+- `crond` and `crontab` exit with status 1 on usage errors, as in cronie.
+- `crond -n` no longer logs every line twice when its stderr is the systemd journal.
+- Library API: `Entry::quiet` is now `Entry::dont_log`, `Entry::tz` is a `JobTz`, `Crontab::random_delay` moved to `Entry::random_delay`, and `Crontab::warnings` was added. `EntryError::BadTimezone` and `EntryError::BadRandomDelay` were removed and `EntryError::BadOption` was added.
+
 ## [0.1.1] - 2026-09-14
 
 ### Added

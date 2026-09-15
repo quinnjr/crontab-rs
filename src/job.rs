@@ -94,7 +94,7 @@ impl Runner {
         let env = self.build_env(&pw, entry);
         let shell = env_get(&env, "SHELL").unwrap_or("/bin/sh").to_string();
 
-        if !entry.quiet {
+        if !entry.dont_log {
             log::info!("({user}) CMD ({})", entry.raw_command);
         }
 
@@ -177,7 +177,7 @@ impl Runner {
             }
         }
 
-        if !entry.quiet {
+        if !entry.dont_log {
             log::info!("({user}) CMDEND ({})", entry.raw_command);
         }
         if !status.success() {

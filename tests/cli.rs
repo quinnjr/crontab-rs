@@ -389,11 +389,16 @@ fn run_at_bad_time_fails() {
 }
 
 #[test]
-fn crond_run_at_fails_when_job_cannot_run() {
+fn crond_rejects_system_crontab_with_unknown_user() {
     let env = Env::new();
+    let out = env.path("ran");
     fs::write(
         env.path("cron.d").join("badjob"),
-        "* * * * * no-such-user-xyz123 echo x\n",
+        format!(
+            "* * * * * {} touch {}\n* * * * * no-such-user-xyz123 echo x\n",
+            me(),
+            out.display()
+        ),
     )
     .unwrap();
     let o = env
@@ -401,7 +406,67 @@ fn crond_run_at_fails_when_job_cannot_run() {
         .args(["-p", "-m", "off", "--run-at", "2026-01-01 00:00"])
         .output()
         .unwrap();
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(stderr(&o).contains("BAD CRONTAB"), "{}", stderr(&o));
+    assert!(stderr(&o).contains("bad username"), "{}", stderr(&o));
+    assert!(!out.exists(), "no job from a rejected file may run");
+}
+
+#[test]
+fn crond_run_at_fails_when_job_cannot_run() {
+    if nix::unistd::geteuid().is_root() {
+        return;
+    }
+    let env = Env::new();
+    // A spool crontab for root, loaded with -p by a non-root daemon: the
+    // job is due but the daemon cannot switch to root to run it.
+    fs::write(env.path("spool").join("root"), "* * * * * true\n").unwrap();
+    let o = env
+        .crond()
+        .args(["-p", "-m", "off", "--run-at", "2026-01-01 00:00"])
+        .output()
+        .unwrap();
     assert!(!o.status.success(), "{}", stderr(&o));
+}
+
+#[test]
+fn usage_errors_exit_1_like_cronie() {
+    let env = Env::new();
+    let o = env.crontab(&["--bogus-flag"], None);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    let o = env.crond().arg("-Z").output().unwrap();
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    let o = env.crontab(&["--help"], None);
+    assert_eq!(o.status.code(), Some(0));
+}
+
+#[test]
+fn syntax_test_matches_cronie_grammar() {
+    let env = Env::new();
+    for (line, ok) in [
+        ("5/10 * * * * x", false),
+        ("* * * * monday x", false),
+        ("@HOURLY x", false),
+        ("0~59/10 * * * * x", false),
+        ("* * * * * -q x", false),
+        ("-* * * * * x", false),
+        ("5-3 * * * * x", true),
+        ("* * * * sat-sun x", true),
+        ("1FOO=bar", true),
+        ("CRON_TZ=Mars/Olympus", true),
+        ("RANDOM_DELAY=abc", true),
+        ("* * * * * -n x", true),
+    ] {
+        let o = env.crontab(&["-T", "-"], Some(&format!("{line}\n")));
+        assert_eq!(o.status.success(), ok, "{line:?}: {}", stderr(&o));
+    }
+    let o = env.crontab(&["-T", "-"], Some("*/61 * * * * x\n"));
+    assert!(o.status.success());
+    assert!(
+        stderr(&o).contains("Warning: Step size 61 higher than possible maximum of 59"),
+        "{}",
+        stderr(&o)
+    );
 }
 
 #[test]

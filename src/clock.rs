@@ -5,8 +5,8 @@
 //! minute counter, which is what lets the daemon run skipped jobs or avoid
 //! repeating them.
 
+use crate::crontab::JobTz;
 use chrono::{DateTime, Local, NaiveDateTime, Offset, TimeZone, Utc};
-use chrono_tz::Tz;
 
 /// The current local minute and the UTC offset (seconds) in effect.
 pub fn now() -> (i64, i32) {
@@ -32,12 +32,20 @@ pub fn wall_time(minute: i64) -> NaiveDateTime {
 }
 
 /// Wall-clock fields for a local minute as seen in another time zone.
-pub fn wall_time_in_tz(minute: i64, gmtoff: i32, tz: Tz) -> NaiveDateTime {
+pub fn wall_time_in_tz(minute: i64, gmtoff: i32, tz: JobTz) -> NaiveDateTime {
     let instant = minute * 60 - gmtoff as i64;
-    tz.timestamp_opt(instant, 0)
-        .single()
-        .unwrap_or_else(|| tz.timestamp_opt(instant, 0).earliest().unwrap())
-        .naive_local()
+    match tz {
+        JobTz::Named(tz) => tz
+            .timestamp_opt(instant, 0)
+            .single()
+            .unwrap_or_else(|| tz.timestamp_opt(instant, 0).earliest().unwrap())
+            .naive_local(),
+        JobTz::Fixed(offset) => offset
+            .timestamp_opt(instant, 0)
+            .single()
+            .expect("fixed offsets are unambiguous")
+            .naive_local(),
+    }
 }
 
 /// Seconds since the epoch at the start of the *next* local minute after
@@ -67,10 +75,18 @@ mod tests {
     fn tz_conversion() {
         // Minute counter expressed with gmtoff 0 == UTC.
         let m = 29_820_240; // 2026-09-12 12:00 UTC
-        let w = wall_time_in_tz(m, 0, chrono_tz::Asia::Tokyo);
+        let w = wall_time_in_tz(m, 0, JobTz::Named(chrono_tz::Asia::Tokyo));
         assert_eq!((w.day(), w.hour(), w.minute()), (12, 21, 0));
-        let w = wall_time_in_tz(m, 3600, chrono_tz::UTC); // 12:00 local at +01:00
+        let w = wall_time_in_tz(m, 3600, JobTz::Named(chrono_tz::UTC)); // 12:00 local at +01:00
         assert_eq!(w.hour(), 11);
+    }
+
+    #[test]
+    fn fixed_offset_tz() {
+        let m = 29_820_240; // 2026-09-12 12:00 UTC
+        let off = chrono::FixedOffset::west_opt(5 * 3600).unwrap();
+        let w = wall_time_in_tz(m, 0, JobTz::Fixed(off));
+        assert_eq!((w.day(), w.hour()), (12, 7));
     }
 
     #[test]

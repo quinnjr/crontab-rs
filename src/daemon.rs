@@ -299,7 +299,7 @@ impl Scheduler {
             if tab.format == Format::User && !users_ok {
                 continue;
             }
-            for entry in &tab.crontab.entries {
+            for (idx, entry) in tab.crontab.entries.iter().enumerate() {
                 let wild = entry.schedule.is_wild();
                 let wanted = match pass {
                     Pass::All => true,
@@ -314,7 +314,11 @@ impl Scheduler {
                     None => local,
                 };
                 if entry.schedule.matches(&t) {
-                    let delay = if self.honor_delay { tab.delay } else { 0 };
+                    let delay = if self.honor_delay {
+                        tab.delays.get(idx).copied().unwrap_or(0)
+                    } else {
+                        0
+                    };
                     handles.extend(self.dispatch(tab, entry, delay));
                 }
             }

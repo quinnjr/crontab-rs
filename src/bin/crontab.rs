@@ -62,7 +62,19 @@ fn main() -> ExitCode {
     // files) is private; never inherit a permissive umask from the caller.
     umask(Mode::from_bits_truncate(0o077));
 
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            // cronie exits 1 on usage errors; help and version exit 0.
+            let _ = e.print();
+            return match e.kind() {
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => {
+                    ExitCode::SUCCESS
+                }
+                _ => ExitCode::FAILURE,
+            };
+        }
+    };
     let cfg = Config::from_env();
 
     let file_action =
@@ -190,10 +202,13 @@ fn main() -> ExitCode {
         Ok(t) => t,
         Err(e) => return fail(format!("{source}: {e}")),
     };
-    if let Err(errors) = Crontab::parse(&text, Format::User) {
-        report_errors(source, &errors);
-        eprintln!("errors in crontab file, can't install.");
-        return ExitCode::FAILURE;
+    match Crontab::parse_as(&text, Format::User, target.uid.is_root()) {
+        Ok(tab) => print_warnings(&tab),
+        Err(errors) => {
+            report_errors(source, &errors);
+            eprintln!("errors in crontab file, can't install.");
+            return ExitCode::FAILURE;
+        }
     }
     match install(&cfg, &target, &text) {
         Ok(()) => ExitCode::SUCCESS,
@@ -215,6 +230,13 @@ fn read_input(source: &str) -> io::Result<String> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "not valid UTF-8"))
 }
 
+/// cronie prints parse warnings, such as oversized steps, to stderr.
+fn print_warnings(tab: &Crontab) {
+    for w in &tab.warnings {
+        eprintln!("{w}");
+    }
+}
+
 fn report_errors(source: &str, errors: &[ParseError]) {
     for e in errors {
         eprintln!("\"{source}\":{}: {}", e.line, e.error);
@@ -226,8 +248,9 @@ fn test_file(source: &str) -> ExitCode {
         Ok(t) => t,
         Err(e) => return fail(format!("{source}: {e}")),
     };
-    match Crontab::parse(&text, Format::User) {
-        Ok(_) => {
+    match Crontab::parse_as(&text, Format::User, getuid().is_root()) {
+        Ok(tab) => {
+            print_warnings(&tab);
             println!("No syntax issues were found in the crontab file.");
             ExitCode::SUCCESS
         }
@@ -418,8 +441,9 @@ fn edit_session(
             eprintln!("crontab: no changes made to crontab");
             return EditOutcome::done(ExitCode::SUCCESS);
         }
-        match Crontab::parse(&edited, Format::User) {
-            Ok(_) => {
+        match Crontab::parse_as(&edited, Format::User, target.uid.is_root()) {
+            Ok(tab) => {
+                print_warnings(&tab);
                 return match install(cfg, target, &edited) {
                     Ok(()) => {
                         eprintln!("crontab: installing new crontab");

@@ -23,7 +23,7 @@ source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz
         '0periodic'
         'crontab'
         'cron-deny')
-sha256sums=('2aacc48ca0608aada224ec52f06d91072678d4c6befdb07f9d0eb90e920914ce'
+sha256sums=('8fc09109b9dc4255a4edfaa3c32f71dfb43f90f923f20261c9f021770d3ac75f'
             '95962bbf85e05bdce4c8d1be9de601f88092defd4495d91b48e06453a9197aa0'
             '21442b95fbe14505405710deadc8d1396f4fb20e3e4efdccde024141403e057b'
             'e2b3b38d0f63b24941c3f48d72b5c1cfd36f9511b47fe572cb71ed23e2521503'

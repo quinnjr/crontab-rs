@@ -1,0 +1,32 @@
+[package]
+name = "crontab-rs"
+version = "0.1.0"
+edition = "2024"
+description = "A cronie/Vixie-compatible cron daemon and crontab utility written in Rust"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/quinnjr/crontab-rs"
+rust-version = "1.96"
+
+[lib]
+name = "crontab_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "crond"
+path = "src/bin/crond.rs"
+
+[[bin]]
+name = "crontab"
+path = "src/bin/crontab.rs"
+
+[dependencies]
+chrono = "0.4"
+chrono-tz = "0.10"
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+log = "0.4"
+nix = { version = "0.31", features = ["user", "process", "signal", "fs", "hostname"] }
+rand = "0.10"
+signal-hook = "0.4"
+syslog = "7"
+tempfile = "3"

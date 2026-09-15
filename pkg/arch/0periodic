@@ -1,0 +1,10 @@
+# Run the daily, weekly and monthly jobs.
+# crontab-rs has no anacron, so these run at fixed times.
+# Jobs missed while the machine is off are not caught up.
+SHELL=/bin/bash
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+MAILTO=root
+RANDOM_DELAY=45
+25 4 * * *   root run-parts /etc/cron.daily
+47 4 * * 0   root run-parts /etc/cron.weekly
+52 4 1 * *   root run-parts /etc/cron.monthly

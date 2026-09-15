@@ -1,0 +1,5 @@
+# /etc/crontab: configuration file for cron
+
+# See crontab(5) for details.
+
+# m h dom mon dow user command

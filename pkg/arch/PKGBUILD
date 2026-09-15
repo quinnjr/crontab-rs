@@ -1,0 +1,72 @@
+# Maintainer: Joseph R. Quinn <quinn.josephr@gmail.com>
+
+pkgname=crontab-rs
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Cronie-compatible cron daemon and crontab utility written in Rust'
+url='https://github.com/quinnjr/crontab-rs'
+license=('MIT OR Apache-2.0')
+arch=('x86_64' 'aarch64')
+depends=('glibc' 'libgcc' 'run-parts')
+makedepends=('cargo')
+optdepends=('smtp-server: send job output via email'
+            'smtp-forwarder: forward job output to email server')
+provides=('cron')
+conflicts=('cron' 'cronie')
+backup=('etc/crontab'
+        'etc/cron.d/0hourly'
+        'etc/cron.d/0periodic'
+        'etc/cron.deny')
+install=crontab-rs.install
+source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz"
+        '80-crontab-rs.hook'
+        '0periodic'
+        'crontab'
+        'cron-deny')
+sha256sums=('2aacc48ca0608aada224ec52f06d91072678d4c6befdb07f9d0eb90e920914ce'
+            '95962bbf85e05bdce4c8d1be9de601f88092defd4495d91b48e06453a9197aa0'
+            '21442b95fbe14505405710deadc8d1396f4fb20e3e4efdccde024141403e057b'
+            'e2b3b38d0f63b24941c3f48d72b5c1cfd36f9511b47fe572cb71ed23e2521503'
+            'ae6e533ecdfc1bd2dd80a9e25acb0260cbe9f00c4e4abee93d552b3660f263fc')
+
+prepare() {
+  cd "${pkgname}-${pkgver}"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "${pkgname}-${pkgver}"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release
+}
+
+check() {
+  cd "${pkgname}-${pkgver}"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo test --frozen --release
+}
+
+package() {
+  cd "${pkgname}-${pkgver}"
+
+  install -Dm0755 target/release/crond "${pkgdir}/usr/bin/crond"
+  install -Dm4755 target/release/crontab "${pkgdir}/usr/bin/crontab"
+
+  install -dm0700 "${pkgdir}/var/spool/cron"
+  install -dm0755 "${pkgdir}"/etc/cron.{d,hourly,daily,weekly,monthly}
+
+  install -Dm0644 contrib/0hourly "${pkgdir}/etc/cron.d/0hourly"
+  install -Dm0644 ../0periodic "${pkgdir}/etc/cron.d/0periodic"
+  install -Dm0644 ../crontab "${pkgdir}/etc/crontab"
+  install -Dm0644 ../cron-deny "${pkgdir}/etc/cron.deny"
+
+  install -Dm0644 contrib/crond.service "${pkgdir}/usr/lib/systemd/system/crond.service"
+  ln -s crond.service "${pkgdir}/usr/lib/systemd/system/cronie.service"
+  install -Dm0644 ../80-crontab-rs.hook "${pkgdir}/usr/share/libalpm/hooks/80-crontab-rs.hook"
+
+  install -Dm0644 README.md CHANGELOG.md -t "${pkgdir}/usr/share/doc/${pkgname}"
+  install -Dm0644 LICENSE-MIT LICENSE-APACHE -t "${pkgdir}/usr/share/licenses/${pkgname}"
+}

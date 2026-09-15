@@ -103,6 +103,29 @@ where every due job started, or where no job was due, exits zero.
 - When no mailer is configured and no MTA can be found, `crond` logs "No MTA
   installed" at startup and job output is logged instead of mailed.
 
+## Arch Linux package
+
+`pkg/arch/PKGBUILD` builds a package that replaces cronie as the system cron.
+It provides `cron` and conflicts with `cronie`, so pacman offers to remove
+cronie when you install it.
+
+```sh
+cd pkg/arch
+makepkg -si
+systemctl enable --now crond.service
+```
+
+The package installs `crond`, a set-user-ID `crontab`, `crond.service`, and
+`cronie.service` as an alias of `crond.service`. An existing cronie enablement
+therefore keeps working. It also ships `/etc/crontab`, `/etc/cron.deny`,
+`/etc/cron.d/0hourly`, the `cron.hourly`, `cron.daily`, `cron.weekly` and
+`cron.monthly` directories, and a pacman hook that restarts `crond` after a
+glibc or crontab-rs upgrade.
+
+crontab-rs has no anacron. `/etc/cron.d/0periodic` runs the daily, weekly and
+monthly directories at fixed times instead, and jobs missed while the machine
+is off are not caught up. PAM is not used.
+
 ## Install
 
 ```sh

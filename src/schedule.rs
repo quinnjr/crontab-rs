@@ -139,9 +139,40 @@ pub(crate) fn trim_blanks(s: &str) -> &str {
     s.trim_start_matches(is_blank)
 }
 
-/// A field ends at a blank or at the end of the line.
-fn is_field_end(c: char) -> bool {
-    is_blank(c) || c == '\n'
+/// C's `EOF` as returned by `getc`.
+pub(crate) const EOF: i32 = -1;
+const NL: i32 = b'\n' as i32;
+
+/// A C stdio stream as cronie's parser reads it: `get_char` returns a byte
+/// (0..=255) or [`EOF`], and `unget_char` pushes one back (a no-op for `EOF`).
+pub(crate) trait CharStream {
+    fn get_char(&mut self) -> i32;
+    fn unget_char(&mut self, ch: i32);
+}
+
+/// cronie's `Skip_Blanks` macro.
+pub(crate) fn skip_blanks<S: CharStream>(s: &mut S, mut ch: i32) -> i32 {
+    while ch == i32::from(b' ') || ch == i32::from(b'\t') {
+        ch = s.get_char();
+    }
+    ch
+}
+
+/// cronie's `get_string(str, size, file, terms)`: reads up to (and consuming)
+/// EOF, a byte in `terms` or a NUL byte (`strchr` finds the terminator of
+/// `terms`), keeping at most `size - 1` bytes. Returns the terminator and the
+/// kept bytes.
+pub(crate) fn get_string<S: CharStream>(s: &mut S, size: usize, terms: &[u8]) -> (i32, Vec<u8>) {
+    let mut out = Vec::new();
+    loop {
+        let ch = s.get_char();
+        if ch == EOF || ch == 0 || terms.contains(&(ch as u8)) {
+            return (ch, out);
+        }
+        if out.len() + 1 < size {
+            out.push(ch as u8);
+        }
+    }
 }
 
 impl Schedule {
@@ -158,31 +189,30 @@ impl Schedule {
     /// for `~` ranges and a sink for warnings such as cronie's "Step size N
     /// higher than possible maximum of M". Warnings found before an error are
     /// kept, as cronie prints them before the error.
+    ///
+    /// The text is read exactly as cronie's `load_entry` reads a line, with
+    /// the end of `line` acting as its newline.
     pub fn parse_prefix_with<'a, R: Rng>(
         line: &'a str,
         rng: &mut R,
         warnings: &mut Vec<String>,
     ) -> Result<(Schedule, &'a str), ScheduleError> {
         let line = trim_blanks(line);
-        if let Some(rest) = line.strip_prefix('@') {
-            let end = rest.find(is_field_end).unwrap_or(rest.len());
-            let (name, remainder) = rest.split_at(end);
-            // get_string(cmd, MAX_COMMAND, file, " \t\n") keeps at most
-            // MAX_COMMAND - 1 bytes (cut at a character boundary here).
-            let name = &name[..name.floor_char_boundary(MAX_COMMAND - 1)];
-            let spec = match name {
-                "reboot" => return Ok((Schedule::reboot(), trim_blanks(remainder))),
-                "yearly" | "annually" => "0 0 1 1 *",
-                "monthly" => "0 0 1 * *",
-                "weekly" => "0 0 * * 0",
-                "daily" | "midnight" => "0 0 * * *",
-                "hourly" => "0 * * * *",
-                _ => return Err(ScheduleError::BadTimeSpecifier),
-            };
-            let (schedule, _) = Self::parse_fields(spec, rng, warnings)?;
-            return Ok((schedule, trim_blanks(remainder)));
-        }
-        Self::parse_fields(line, rng, warnings)
+        let mut stream = StrStream {
+            bytes: line.as_bytes(),
+            pos: 0,
+            back: Vec::new(),
+            newline_read: false,
+        };
+        let ch = stream.get_char();
+        let (schedule, ch) = load_schedule(ch, &mut stream, rng, warnings).map_err(|(e, _)| e)?;
+        stream.unget_char(ch);
+        let rest = if stream.back.is_empty() {
+            line.get(stream.pos..).unwrap_or("")
+        } else {
+            ""
+        };
+        Ok((schedule, rest))
     }
 
     /// Parse a complete five-field specification (or `@shortcut`) with no
@@ -194,48 +224,6 @@ impl Schedule {
         } else {
             Err(ScheduleError::BadTimeSpecifier)
         }
-    }
-
-    fn parse_fields<'a, R: Rng>(
-        line: &'a str,
-        rng: &mut R,
-        warnings: &mut Vec<String>,
-    ) -> Result<(Schedule, &'a str), ScheduleError> {
-        let mut rest = trim_blanks(line);
-        let mut next = |field: Field| -> Result<(u64, bool), ScheduleError> {
-            let end = rest.find(is_field_end).unwrap_or(rest.len());
-            let (token, remainder) = rest.split_at(end);
-            if token.is_empty() {
-                return Err(field.error());
-            }
-            rest = trim_blanks(remainder);
-            parse_list(token, field, rng, warnings)
-        };
-        let (minutes, minute_star) = next(Field::Minute)?;
-        let (hours, hour_star) = next(Field::Hour)?;
-        let (days_of_month, dom_star) = next(Field::DayOfMonth)?;
-        let (months, _) = next(Field::Month)?;
-        let (days_of_week, dow_star) = next(Field::DayOfWeek)?;
-        // Day-of-week 0 and 7 are both Sunday.
-        let mut dow = (days_of_week & 0x7f) as u8;
-        if days_of_week & (1 << 7) != 0 {
-            dow |= 1;
-        }
-        Ok((
-            Schedule {
-                minutes,
-                hours: hours as u32,
-                days_of_month: days_of_month as u32,
-                months: months as u16,
-                days_of_week: dow,
-                minute_star,
-                hour_star,
-                dom_star,
-                dow_star,
-                reboot: false,
-            },
-            rest,
-        ))
     }
 
     /// The `@reboot` schedule.
@@ -331,152 +319,371 @@ impl Schedule {
     }
 }
 
-fn parse_list<R: Rng>(
-    token: &str,
-    field: Field,
-    rng: &mut R,
-    warnings: &mut Vec<String>,
-) -> Result<(u64, bool), ScheduleError> {
-    let star = token.starts_with('*');
-    let mut bits = 0u64;
-    for part in token.split(',') {
-        bits |= parse_range(part, field, rng, warnings)?;
-    }
-    Ok((bits, star))
+/// A `&str` read as a stream whose end is a newline (read once) followed by
+/// EOF.
+struct StrStream<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+    back: Vec<i32>,
+    newline_read: bool,
 }
 
-/// Split off the leading run of ASCII alphanumerics (cronie's `get_number`
-/// reads exactly this much).
-fn take_alnum(s: &str) -> (&str, &str) {
-    let end = s
-        .find(|c: char| !c.is_ascii_alphanumeric())
-        .unwrap_or(s.len());
-    s.split_at(end)
-}
-
-/// `(int) strtol(digits, NULL, 10)` on LP64: saturate to the `long` range,
-/// then keep the low 32 bits.
-fn c_int_from_digits(digits: &str) -> i32 {
-    let mut value: i64 = 0;
-    for b in digits.bytes() {
-        value = value.saturating_mul(10).saturating_add(i64::from(b - b'0'));
-    }
-    value as i32
-}
-
-/// cronie's `get_number`: a decimal number, or an exact (case-insensitive)
-/// three-letter name for fields that have names.
-fn get_number(token: &str, field: Field) -> Result<i32, ScheduleError> {
-    // cronie: `if (++len >= MAX_TEMPSTR) goto bad;`
-    if token.is_empty() || token.len() >= MAX_TEMPSTR {
-        return Err(field.error());
-    }
-    if token.bytes().all(|b| b.is_ascii_digit()) {
-        return Ok(c_int_from_digits(token));
-    }
-    let (low, _) = field.bounds();
-    field
-        .names()
-        .and_then(|names| names.iter().position(|n| n.eq_ignore_ascii_case(token)))
-        .map(|i| low + i as i32)
-        .ok_or(field.error())
-}
-
-/// An optional `/step` after `*` or a range: digits only, non-zero as a C
-/// `int`, and nothing after it.
-fn optional_step(after: &str, field: Field) -> Result<i32, ScheduleError> {
-    if after.is_empty() {
-        return Ok(1);
-    }
-    let digits = after.strip_prefix('/').ok_or(field.error())?;
-    let (token, rest) = take_alnum(digits);
-    if token.is_empty()
-        || token.len() >= MAX_TEMPSTR
-        || !rest.is_empty()
-        || !token.bytes().all(|b| b.is_ascii_digit())
-    {
-        return Err(field.error());
-    }
-    match c_int_from_digits(token) {
-        0 => Err(field.error()),
-        step => Ok(step),
-    }
-}
-
-fn parse_range<R: Rng>(
-    part: &str,
-    field: Field,
-    rng: &mut R,
-    warnings: &mut Vec<String>,
-) -> Result<u64, ScheduleError> {
-    let (low, high) = field.bounds();
-    let err = field.error();
-
-    let (first, last, step) = if let Some(rest) = part.strip_prefix('*') {
-        (low, high, optional_step(rest, field)?)
-    } else if let Some(rest) = part.strip_prefix('~') {
-        let pick = random_pick(low, rest, field, rng)?;
-        (pick, pick, 1)
-    } else {
-        let (tok1, after) = take_alnum(part);
-        let a = get_number(tok1, field)?;
-        if after.is_empty() {
-            (a, a, 1)
-        } else if let Some(r) = after.strip_prefix('-') {
-            let (tok2, after2) = take_alnum(r);
-            let b = get_number(tok2, field)?;
-            (a, b, optional_step(after2, field)?)
-        } else if let Some(r) = after.strip_prefix('~') {
-            let pick = random_pick(a, r, field, rng)?;
-            (pick, pick, 1)
-        } else {
-            return Err(err);
+impl CharStream for StrStream<'_> {
+    fn get_char(&mut self) -> i32 {
+        if let Some(ch) = self.back.pop() {
+            return ch;
         }
-    };
+        if let Some(&b) = self.bytes.get(self.pos) {
+            self.pos += 1;
+            i32::from(b)
+        } else if !self.newline_read {
+            self.newline_read = true;
+            NL
+        } else {
+            EOF
+        }
+    }
 
-    let span = last.wrapping_sub(first);
+    fn unget_char(&mut self, ch: i32) {
+        if ch == EOF {
+            return;
+        }
+        if self.back.is_empty() {
+            if ch == NL && self.newline_read && self.pos == self.bytes.len() {
+                self.newline_read = false;
+                return;
+            }
+            if self.pos > 0 && i32::from(self.bytes[self.pos - 1]) == ch {
+                self.pos -= 1;
+                return;
+            }
+        }
+        self.back.push(ch);
+    }
+}
+
+const ALL_HOURS: u32 = (1 << 24) - 1;
+const ALL_DOM: u32 = !1;
+const ALL_MONTHS: u16 = 0x1ffe;
+const ALL_DOW: u8 = 0x7f;
+
+/// The time part of cronie's `load_entry`, from `ch` (the first character of
+/// the specification, already read) on. On success returns the character
+/// after the specification and its trailing blanks (still consumed, as in
+/// cronie); on error returns the error and cronie's `ch` at its `goto eof`.
+pub(crate) fn load_schedule<S: CharStream, R: Rng>(
+    ch: i32,
+    s: &mut S,
+    rng: &mut R,
+    warnings: &mut Vec<String>,
+) -> Result<(Schedule, i32), (ScheduleError, i32)> {
+    if ch == i32::from(b'@') {
+        let (ch, name) = get_string(s, MAX_COMMAND, b" \t\n");
+        let mut e = Schedule {
+            minutes: 1,
+            hours: 1,
+            days_of_month: ALL_DOM,
+            months: ALL_MONTHS,
+            days_of_week: ALL_DOW,
+            minute_star: false,
+            hour_star: false,
+            dom_star: false,
+            dow_star: false,
+            reboot: false,
+        };
+        match name.as_slice() {
+            b"reboot" => e = Schedule::reboot(),
+            b"yearly" | b"annually" => {
+                e.days_of_month = 1 << 1;
+                e.months = 1 << 1;
+                e.dow_star = true;
+            }
+            b"monthly" => {
+                e.days_of_month = 1 << 1;
+                e.dow_star = true;
+            }
+            b"weekly" => {
+                e.days_of_week = 1;
+                e.dom_star = true;
+            }
+            b"daily" | b"midnight" => {}
+            b"hourly" => {
+                e.hours = ALL_HOURS;
+                e.hour_star = true;
+            }
+            _ => return Err((ScheduleError::BadTimeSpecifier, ch)),
+        }
+        return Ok((e, skip_blanks(s, ch)));
+    }
+
+    let star = |ch: i32| ch == i32::from(b'*');
+    let minute_star = star(ch);
+    let (minutes, ch) = get_list(Field::Minute, ch, s, rng, warnings)?;
+    let hour_star = star(ch);
+    let (hours, ch) = get_list(Field::Hour, ch, s, rng, warnings)?;
+    let dom_star = star(ch);
+    let (days_of_month, ch) = get_list(Field::DayOfMonth, ch, s, rng, warnings)?;
+    let (months, ch) = get_list(Field::Month, ch, s, rng, warnings)?;
+    let dow_star = star(ch);
+    let (days_of_week, ch) = get_list(Field::DayOfWeek, ch, s, rng, warnings)?;
+    // Day-of-week 0 and 7 are both Sunday.
+    let mut dow = (days_of_week & 0x7f) as u8;
+    if days_of_week & (1 << 7) != 0 {
+        dow |= 1;
+    }
+    Ok((
+        Schedule {
+            minutes,
+            hours: hours as u32,
+            days_of_month: days_of_month as u32,
+            months: months as u16,
+            days_of_week: dow,
+            minute_star,
+            hour_star,
+            dom_star,
+            dow_star,
+            reboot: false,
+        },
+        ch,
+    ))
+}
+
+fn is_separator(ch: i32) -> bool {
+    matches!(u8::try_from(ch), Ok(b'\t' | b'\n' | b' ' | b','))
+}
+
+/// cronie's `get_list`: ranges separated by `,`, then the rest of the field
+/// and the following blanks are skipped.
+fn get_list<S: CharStream, R: Rng>(
+    field: Field,
+    ch: i32,
+    s: &mut S,
+    rng: &mut R,
+    warnings: &mut Vec<String>,
+) -> Result<(u64, i32), (ScheduleError, i32)> {
+    let mut bits = 0u64;
+    s.unget_char(ch);
+    let mut ch;
+    loop {
+        ch = get_range(&mut bits, field, s, rng, warnings);
+        if ch == EOF {
+            return Err((field.error(), EOF));
+        }
+        if ch != i32::from(b',') {
+            break;
+        }
+    }
+    // Skip_Nonblanks, then Skip_Blanks.
+    while ch != i32::from(b'\t') && ch != i32::from(b' ') && ch != NL && ch != EOF {
+        ch = s.get_char();
+    }
+    Ok((bits, skip_blanks(s, ch)))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RangeState {
+    Start,
+    Ast,
+    Step,
+    Terms,
+    Num1,
+    Range,
+    RangeNum2,
+    Random,
+    Finish,
+}
+
+/// cronie's `get_range` state machine. Returns the separator that ended the
+/// range or [`EOF`] on error.
+fn get_range<S: CharStream, R: Rng>(
+    bits: &mut u64,
+    field: Field,
+    s: &mut S,
+    rng: &mut R,
+    warnings: &mut Vec<String>,
+) -> i32 {
+    use RangeState::*;
+    let (low, high) = field.bounds();
+    let names = field.names();
+    let mut step = 1i32;
+    let (mut low_, mut high_) = (0i32, 0i32);
+    let mut state = Start;
+    let mut ch = EOF;
+
+    while state != Finish {
+        ch = s.get_char();
+        if ch == EOF {
+            break;
+        }
+        match state {
+            Start => {
+                if ch == i32::from(b'*') {
+                    low_ = low;
+                    high_ = high;
+                    state = Ast;
+                } else if ch == i32::from(b'~') {
+                    low_ = low;
+                    state = Random;
+                } else {
+                    s.unget_char(ch);
+                    match get_number(low, names, s) {
+                        Some(n) => {
+                            low_ = n;
+                            state = Num1;
+                        }
+                        None => return EOF,
+                    }
+                }
+            }
+            Ast | RangeNum2 => {
+                if ch == i32::from(b'/') {
+                    state = Step;
+                } else if is_separator(ch) {
+                    state = Finish;
+                } else {
+                    return EOF;
+                }
+            }
+            Step => {
+                s.unget_char(ch);
+                match get_number(0, None, s) {
+                    Some(n) if n != 0 => {
+                        step = n;
+                        state = Terms;
+                    }
+                    _ => return EOF,
+                }
+            }
+            Terms => {
+                if is_separator(ch) {
+                    state = Finish;
+                } else {
+                    return EOF;
+                }
+            }
+            Num1 => {
+                if ch == i32::from(b'-') {
+                    state = Range;
+                } else if ch == i32::from(b'~') {
+                    state = Random;
+                } else if is_separator(ch) {
+                    high_ = low_;
+                    state = Finish;
+                } else {
+                    return EOF;
+                }
+            }
+            Range => {
+                s.unget_char(ch);
+                match get_number(low, names, s) {
+                    Some(n) => {
+                        high_ = n;
+                        state = RangeNum2;
+                    }
+                    None => return EOF,
+                }
+            }
+            Random => {
+                if is_separator(ch) {
+                    high_ = high;
+                    state = Finish;
+                } else {
+                    s.unget_char(ch);
+                    match get_number(low, names, s) {
+                        Some(n) => {
+                            high_ = n;
+                            state = Terms;
+                        }
+                        None => return EOF,
+                    }
+                }
+                if low_ > high_ {
+                    return EOF;
+                }
+                // cronie: random() % (high_ - low_ + 1) + low_
+                let pick = rng.random_range(i64::from(low_)..=i64::from(high_)) as i32;
+                low_ = pick;
+                high_ = pick;
+            }
+            Finish => unreachable!(),
+        }
+    }
+    if state != Finish || ch == EOF {
+        return EOF;
+    }
+
+    let span = high_.wrapping_sub(low_);
     if step > 1 && step > span {
         let max = if span > 0 { span } else { 1 };
         warnings.push(format!(
             "Warning: Step size {step} higher than possible maximum of {max}"
         ));
     }
-    // cronie's loop: `for (i = low_; i <= high_; i += step) set_element(i)`,
-    // where set_element fails for values outside the field.
-    let mut bits = 0u64;
-    let mut i = first;
-    while i <= last {
+    // for (i = low_; i <= high_; i += step) set_element(i)
+    let mut i = low_;
+    while i <= high_ {
         if i < low || i > high {
-            return Err(err);
+            s.unget_char(ch);
+            return EOF;
         }
-        bits |= 1u64 << i;
+        *bits |= 1u64 << i;
         i = i.wrapping_add(step);
     }
-    Ok(bits)
+    ch
 }
 
-/// `[a] "~" [b]`: cronie picks `random() % (b - a + 1) + a` when loading and
-/// then checks the pick against the field.
-fn random_pick<R: Rng>(
-    start: i32,
-    rest: &str,
-    field: Field,
-    rng: &mut R,
-) -> Result<i32, ScheduleError> {
-    let (_, high) = field.bounds();
-    let end = if rest.is_empty() {
-        high
-    } else {
-        let (tok, after) = take_alnum(rest);
-        if !after.is_empty() {
-            return Err(field.error());
-        }
-        get_number(tok, field)?
-    };
-    if start > end {
-        return Err(field.error());
+/// `(int) strtol(digits, NULL, 10)` on LP64: saturate to the `long` range,
+/// then keep the low 32 bits.
+fn c_int_from_digits(digits: &[u8]) -> i32 {
+    let mut value: i64 = 0;
+    for &b in digits {
+        value = value.saturating_mul(10).saturating_add(i64::from(b - b'0'));
     }
-    Ok(rng.random_range(i64::from(start)..=i64::from(end)) as i32)
+    value as i32
+}
+
+/// cronie's `get_number`: a run of ASCII alphanumerics that is a decimal
+/// number or, for fields with names, an exact (case-insensitive) three-letter
+/// name. Like cronie, a token that is neither pushes its terminator back
+/// twice.
+fn get_number<S: CharStream>(
+    low: i32,
+    names: Option<&'static [&'static str]>,
+    s: &mut S,
+) -> Option<i32> {
+    let mut temp = Vec::new();
+    let mut ch;
+    loop {
+        ch = s.get_char();
+        match u8::try_from(ch) {
+            Ok(b) if b.is_ascii_alphanumeric() => {
+                // if (++len >= MAX_TEMPSTR) goto bad;
+                if temp.len() + 1 >= MAX_TEMPSTR {
+                    s.unget_char(ch);
+                    return None;
+                }
+                temp.push(b);
+            }
+            _ => break,
+        }
+    }
+    if temp.is_empty() {
+        s.unget_char(ch);
+        return None;
+    }
+    s.unget_char(ch);
+    if temp.iter().all(u8::is_ascii_digit) {
+        return Some(c_int_from_digits(&temp));
+    }
+    if let Some(i) = names.and_then(|names| {
+        names
+            .iter()
+            .position(|n| n.as_bytes().eq_ignore_ascii_case(&temp))
+    }) {
+        return Some(low + i as i32);
+    }
+    s.unget_char(ch);
+    None
 }
 
 #[cfg(test)]

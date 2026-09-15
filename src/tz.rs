@@ -41,9 +41,19 @@
 //!   glibc 2.44 on x86-64 observably reads before the table).
 //! * During an inserted leap second in a `right/` zone glibc displays second
 //!   `60`; [`Zone::wall_time`] has no leap-second representation and shows `59`.
-//! * Zone files are opened non-blocking and must be regular files of at most
-//!   [`MAX_TZIF_BYTES`]; glibc would block forever on a FIFO and read files of
-//!   any size. Anything else is treated like a missing file (POSIX parsing).
+//! * Zone files must be regular files of at most [`MAX_TZIF_BYTES`] (1 MiB);
+//!   glibc would block forever on a FIFO, open devices, and read files of any
+//!   size. The path is first opened `O_PATH` (which follows symlinks but never
+//!   runs a device's open handler), checked with `fstat`, and only then that
+//!   exact inode is re-opened for reading through `/proc/self/fd`. Anything
+//!   else, including a system without `/proc/self/fd`, is treated like a
+//!   missing file (POSIX parsing).
+//!
+//! glibc re-`stat`s the zone file on every `localtime` and reloads it when it
+//! changed. [`ZoneCache`] provides the same freshness for a long-running
+//! daemon: every lookup re-`stat`s the resolved path, and file-backed zones
+//! are shared by file identity, so differently spelled paths to one file
+//! share one parsed copy.
 //!
 //! Like glibc, a set-user-ID or set-group-ID process (`getuid() != geteuid()`
 //! or `getgid() != getegid()`, glibc's `__libc_enable_secure`) refuses
@@ -51,21 +61,28 @@
 //! `/usr/share/zoneinfo`, refuses values containing `../`, and ignores
 //! `$TZDIR` (which the dynamic loader strips for such processes).
 
-use std::ffi::OsString;
+use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::io::Read;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDateTime};
 
 const SECSPERDAY: i128 = 86_400;
 const DEFAULT_TZDIR: &str = "/usr/share/zoneinfo";
-const TZDEFRULES: &str = "posixrules";
-const TZDEFAULT: &str = "/etc/localtime";
-/// Largest zone file we read. Real TZif files are a few KiB (the biggest in
-/// tzdata is under 5 KiB); larger files are treated as unreadable so a crontab
-/// cannot make the daemon slurp arbitrary amounts of data.
-const MAX_TZIF_BYTES: u64 = 16 * 1024 * 1024;
+const TZDEFRULES: &[u8] = b"posixrules";
+const TZDEFAULT: &[u8] = b"/etc/localtime";
+/// Largest zone file we read: 1 MiB. Real TZif files are a few KiB (the
+/// biggest in tzdata is about 4.4 KiB); larger files are treated as unreadable
+/// so a crontab cannot make the daemon slurp arbitrary amounts of data. This
+/// also bounds the memory one cached zone can retain to what parsing 1 MiB can
+/// produce, so a [`ZoneCache`] retains at most `capacity` times that.
+const MAX_TZIF_BYTES: u64 = 1024 * 1024;
+/// Where an `O_PATH` descriptor is re-opened for reading.
+const PROC_FD_DIR: &str = "/proc/self/fd";
 
 /// Time-zone rules selected by a `TZ`/`CRON_TZ` value, resolved like glibc.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,9 +108,13 @@ impl Zone {
     /// Callers handle the empty value themselves (cronie then uses the
     /// daemon's local zone); an empty value (or just ":") yields UTC here.
     pub fn from_tz_value(value: &str) -> Zone {
-        // The value reaches glibc as a C string.
-        let value = value.split('\0').next().unwrap_or("");
-        let value = value.strip_prefix(':').unwrap_or(value);
+        Zone::from_tz_bytes(value.as_bytes())
+    }
+
+    /// Like [`Zone::from_tz_value`], for raw bytes (`CRON_TZ` values from
+    /// non-UTF-8 crontabs are paths/strings of bytes).
+    pub fn from_tz_bytes(value: &[u8]) -> Zone {
+        let value = normalize_value(value);
         if value.is_empty() {
             return Zone::utc();
         }
@@ -103,14 +124,7 @@ impl Zone {
                 inner: Inner::File(Arc::new(raw.file)),
             };
         }
-        let parsed = parse_posix(value.as_bytes(), &mut |stdoff, dstoff| {
-            posixrules_default(&tzdir, stdoff, dstoff)
-        });
-        let inner = match parsed {
-            Parsed::Posix(p) => Inner::Posix(p),
-            Parsed::File(f) => Inner::File(Arc::new(f)),
-        };
-        Zone { inner }
+        resolve_posix(&tzdir, value).0
     }
 
     /// Seconds east of UTC in effect at the given Unix time (glibc's
@@ -172,28 +186,240 @@ fn secure_mode() -> bool {
 /// The path guard `__tzfile_read` applies when `__libc_enable_secure` is set,
 /// with glibc's exact comparisons (the TZDIR check is a plain prefix match, so
 /// `/usr/share/zoneinfoX/…` passes).
-fn path_allowed_in_secure_mode(value: &str) -> bool {
-    let bad_absolute = value.starts_with('/')
+fn path_allowed_in_secure_mode<V: AsRef<[u8]> + ?Sized>(value: &V) -> bool {
+    let value = value.as_ref();
+    let bad_absolute = value.starts_with(b"/")
         && value != TZDEFAULT
-        && !value.as_bytes().starts_with(DEFAULT_TZDIR.as_bytes());
-    !(bad_absolute || value.contains("../"))
+        && !value.starts_with(DEFAULT_TZDIR.as_bytes());
+    !(bad_absolute || value.windows(3).any(|w| w == b"../"))
+}
+
+/// The value as glibc sees it: cut at the first NUL (it reaches glibc as a C
+/// string), then one leading `:` removed.
+fn normalize_value(value: &[u8]) -> &[u8] {
+    let value = value.split(|&c| c == 0).next().unwrap_or(&[]);
+    value.strip_prefix(b":").unwrap_or(value)
+}
+
+/// The file `__tzfile_read(value)` would open, or `None` when the secure-mode
+/// guard refuses it.
+fn zone_path(tzdir: &OsStr, value: &[u8]) -> Option<OsString> {
+    if secure_mode() && !path_allowed_in_secure_mode(value) {
+        return None;
+    }
+    Some(if value.starts_with(b"/") {
+        OsString::from_vec(value.to_vec())
+    } else {
+        let mut p = tzdir.to_os_string();
+        p.push("/");
+        p.push(OsStr::from_bytes(value));
+        p
+    })
 }
 
 /// `__tzfile_read(value)`: resolve against `tzdir` and load, honouring the
 /// secure-mode guard. `None` means "no usable file" (glibc's `lose` paths).
-fn load_zone_file(tzdir: &OsString, value: &str) -> Option<RawTzif> {
-    if secure_mode() && !path_allowed_in_secure_mode(value) {
-        return None;
-    }
-    let path = if value.starts_with('/') {
-        OsString::from(value)
-    } else {
-        let mut p = tzdir.clone();
-        p.push("/");
-        p.push(value);
-        p
+fn load_zone_file(tzdir: &OsStr, value: &[u8]) -> Option<RawTzif> {
+    load_tzif(&zone_path(tzdir, value)?)
+}
+
+/// Parse `value` as a POSIX TZ string (step 3 of [`Zone::from_tz_bytes`]).
+/// Also returns, when `$TZDIR/posixrules` was consulted, the identity of that
+/// file as probed just before loading it (`None` inside: no regular file).
+fn resolve_posix(tzdir: &OsStr, value: &[u8]) -> (Zone, Option<Option<FileId>>) {
+    let mut posixrules = None;
+    let parsed = parse_posix(value, &mut |stdoff, dstoff| {
+        posixrules = Some(zone_path(tzdir, TZDEFRULES).and_then(|p| probe(&p)));
+        posixrules_default(tzdir, stdoff, dstoff)
+    });
+    let inner = match parsed {
+        Parsed::Posix(p) => Inner::Posix(p),
+        Parsed::File(f) => Inner::File(Arc::new(f)),
     };
-    load_tzif(&path)
+    (Zone { inner }, posixrules)
+}
+
+// ---------------------------------------------------------------------------
+// Zone cache for long-running processes
+// ---------------------------------------------------------------------------
+
+/// Identity of a regular file, as `stat` reports it after following symlinks.
+/// The size and timestamps detect in-place rewrites (glibc compares dev, ino
+/// and mtime).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FileId {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl FileId {
+    fn of(meta: &std::fs::Metadata) -> FileId {
+        FileId {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            size: meta.size(),
+            mtime: (meta.mtime(), meta.mtime_nsec()),
+            ctime: (meta.ctime(), meta.ctime_nsec()),
+        }
+    }
+}
+
+/// `stat(path)` following symlinks: the identity of the regular file there, or
+/// `None` if there is none (missing, unreachable, or not a regular file). This
+/// never opens the path.
+fn probe(path: &OsStr) -> Option<FileId> {
+    let meta = std::fs::metadata(path).ok()?;
+    meta.is_file().then(|| FileId::of(&meta))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum CacheKey {
+    /// A zone file, by identity: every spelling of its path shares the entry.
+    File(FileId),
+    /// A value resolved as a POSIX TZ string, by its normalized bytes.
+    Posix(Vec<u8>),
+}
+
+#[derive(Debug)]
+enum CacheValue {
+    /// The parsed file, or `None` if this exact file is not a usable TZif file
+    /// (too large or unparsable), so it is not re-read on every lookup.
+    File(Option<Arc<TzFile>>),
+    Posix {
+        zone: Zone,
+        /// `$TZDIR` in effect when resolved.
+        tzdir: OsString,
+        /// Probed identity of `posixrules` if the string consulted it.
+        posixrules: Option<Option<FileId>>,
+    },
+}
+
+/// A bounded cache of resolved zones for a long-running daemon.
+///
+/// Every [`ZoneCache::get`] re-`stat`s the file the value names (like glibc's
+/// `localtime`), so a replaced, rewritten, created or removed zone file is
+/// picked up on the next lookup. File-backed zones are keyed by file identity
+/// (device, inode, size, mtime, ctime), so all spellings of one path share a
+/// single parsed [`Arc`]; POSIX-string results are keyed by the value. At most
+/// `capacity` entries are held; the least recently used one is evicted.
+#[derive(Debug)]
+pub struct ZoneCache {
+    capacity: usize,
+    tick: u64,
+    entries: HashMap<CacheKey, (CacheValue, u64)>,
+}
+
+impl ZoneCache {
+    /// An empty cache holding at most `capacity` entries (`0` caches nothing).
+    pub fn new(capacity: usize) -> ZoneCache {
+        ZoneCache {
+            capacity,
+            tick: 0,
+            entries: HashMap::new(),
+        }
+    }
+
+    /// Resolve `value` (non-empty TZ/CRON_TZ bytes) exactly like
+    /// [`Zone::from_tz_bytes`], reusing parsed data.
+    pub fn get(&mut self, value: &[u8]) -> Zone {
+        let value = normalize_value(value);
+        if value.is_empty() {
+            return Zone::utc();
+        }
+        let tzdir = tzdir();
+        if let Some(path) = zone_path(&tzdir, value)
+            && let Some(id) = probe(&path)
+        {
+            match self.lookup(&CacheKey::File(id)) {
+                Some(CacheValue::File(Some(file))) => {
+                    return Zone {
+                        inner: Inner::File(Arc::clone(file)),
+                    };
+                }
+                Some(_) => {}
+                None => match open_zone(&path, PROC_FD_DIR) {
+                    Opened::Bytes(id, bytes) => {
+                        let file = parse_tzif(&bytes).map(|raw| Arc::new(raw.file));
+                        self.insert(CacheKey::File(id), CacheValue::File(file.clone()));
+                        if let Some(file) = file {
+                            return Zone {
+                                inner: Inner::File(file),
+                            };
+                        }
+                    }
+                    Opened::Rejected(id) => {
+                        self.insert(CacheKey::File(id), CacheValue::File(None));
+                    }
+                    Opened::Unusable => {}
+                },
+            }
+        }
+
+        let key = CacheKey::Posix(value.to_vec());
+        if let Some(CacheValue::Posix {
+            zone,
+            tzdir: cached_tzdir,
+            posixrules,
+        }) = self.lookup(&key)
+            && *cached_tzdir == tzdir
+            && posixrules
+                .is_none_or(|id| zone_path(&tzdir, TZDEFRULES).and_then(|p| probe(&p)) == id)
+        {
+            return zone.clone();
+        }
+        let (zone, posixrules) = resolve_posix(&tzdir, value);
+        self.insert(
+            key,
+            CacheValue::Posix {
+                zone: zone.clone(),
+                tzdir,
+                posixrules,
+            },
+        );
+        zone
+    }
+
+    /// The entry for `key`, marked as most recently used.
+    fn lookup(&mut self, key: &CacheKey) -> Option<&CacheValue> {
+        self.tick += 1;
+        let tick = self.tick;
+        self.entries.get_mut(key).map(|(value, used)| {
+            *used = tick;
+            &*value
+        })
+    }
+
+    /// Store `value`, evicting least recently used entries beyond capacity.
+    /// Eviction scans all entries; it only runs on a miss.
+    fn insert(&mut self, key: CacheKey, value: CacheValue) {
+        if self.capacity == 0 {
+            return;
+        }
+        self.tick += 1;
+        self.entries.insert(key, (value, self.tick));
+        while self.entries.len() > self.capacity {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+    }
+
+    #[cfg(test)]
+    fn file_entries(&self) -> usize {
+        self.entries
+            .keys()
+            .filter(|k| matches!(k, CacheKey::File(_)))
+            .count()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -654,24 +880,77 @@ impl<'a> Reader<'a> {
     }
 }
 
-fn load_tzif(path: &OsString) -> Option<RawTzif> {
+fn load_tzif(path: &OsStr) -> Option<RawTzif> {
     parse_tzif(&read_zone_bytes(path)?)
 }
 
-/// Read a zone file without blocking and with bounded memory: the file is
-/// opened `O_NONBLOCK` (so FIFOs and devices cannot hang the open), must be a
-/// regular file according to `fstat` on the open handle (symlinks are
-/// followed), and must not exceed [`MAX_TZIF_BYTES`].
-fn read_zone_bytes(path: &OsString) -> Option<Vec<u8>> {
-    let file = std::fs::OpenOptions::new()
+/// Bytes of the zone file at `path`, if it is a readable regular file within
+/// [`MAX_TZIF_BYTES`] (see [`open_zone`]).
+fn read_zone_bytes(path: &OsStr) -> Option<Vec<u8>> {
+    match open_zone(path, PROC_FD_DIR) {
+        Opened::Bytes(_, bytes) => Some(bytes),
+        Opened::Rejected(_) | Opened::Unusable => None,
+    }
+}
+
+/// Outcome of [`open_zone`].
+#[derive(Debug)]
+enum Opened {
+    /// The whole content of the regular file with this identity.
+    Bytes(FileId, Vec<u8>),
+    /// A regular file, larger than [`MAX_TZIF_BYTES`].
+    Rejected(FileId),
+    /// Missing, not a regular file, or not readable right now.
+    Unusable,
+}
+
+/// `open(path, O_PATH | O_CLOEXEC)`: follows symlinks but neither reads nor
+/// runs a device's or FIFO's open handler, so it cannot block or have side
+/// effects.
+fn open_o_path(path: &OsStr) -> Option<OwnedFd> {
+    let c = std::ffi::CString::new(path.as_bytes()).ok()?;
+    // SAFETY: `c` is a valid NUL-terminated string.
+    let fd = unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+    // SAFETY: a non-negative return is a fresh descriptor we now own.
+    (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Read a zone file without side effects and with bounded memory. The path is
+/// opened `O_PATH` and `fstat`ed; only a regular file within
+/// [`MAX_TZIF_BYTES`] is then re-opened for reading, as that exact inode,
+/// through `<proc_fd_dir>/<fd>` (`O_RDONLY | O_NONBLOCK | O_CLOEXEC`), and
+/// checked again with `fstat` before reading. Without `proc_fd_dir` the file
+/// counts as unreadable; the path itself is never opened for reading.
+fn open_zone(path: &OsStr, proc_fd_dir: &str) -> Opened {
+    let Some(handle) = open_o_path(path) else {
+        return Opened::Unusable;
+    };
+    let handle = std::fs::File::from(handle);
+    let Ok(meta) = handle.metadata() else {
+        return Opened::Unusable;
+    };
+    if !meta.is_file() {
+        return Opened::Unusable;
+    }
+    let id = FileId::of(&meta);
+    if meta.size() > MAX_TZIF_BYTES {
+        return Opened::Rejected(id);
+    }
+    let Ok(file) = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)
-        .ok()?;
-    if !file.metadata().ok()?.is_file() {
-        return None;
+        .open(format!("{proc_fd_dir}/{}", handle.as_raw_fd()))
+    else {
+        return Opened::Unusable;
+    };
+    match file.metadata() {
+        Ok(m) if m.is_file() && m.dev() == id.dev && m.ino() == id.ino => {}
+        _ => return Opened::Unusable,
     }
-    read_capped(file, MAX_TZIF_BYTES)
+    match read_capped(file, MAX_TZIF_BYTES) {
+        Some(bytes) => Opened::Bytes(id, bytes),
+        None => Opened::Unusable,
+    }
 }
 
 /// All bytes of `reader`, or `None` on error or if it holds more than `cap`.
@@ -813,7 +1092,7 @@ fn parse_tzif(b: &[u8]) -> Option<RawTzif> {
 }
 
 /// glibc's `__tzfile_default`: apply user offsets to `posixrules` transitions.
-fn posixrules_default(tzdir: &OsString, stdoff: i32, dstoff: i32) -> Option<TzFile> {
+fn posixrules_default(tzdir: &OsStr, stdoff: i32, dstoff: i32) -> Option<TzFile> {
     let RawTzif {
         mut file,
         isstd,
@@ -1516,6 +1795,268 @@ mod tests {
             for t in [i64::MIN, i64::MIN + 1, -1 << 50, 1 << 50, i64::MAX] {
                 let _ = zone.wall_time(t);
                 let _ = zone.utc_offset_at(t);
+            }
+        }
+    }
+
+    const TOKYO: &str = "/usr/share/zoneinfo/Asia/Tokyo";
+    const PARIS: &str = "/usr/share/zoneinfo/Europe/Paris";
+
+    fn file_arc(zone: &Zone) -> &Arc<TzFile> {
+        match &zone.inner {
+            Inner::File(f) => f,
+            Inner::Posix(_) => panic!("not a file-backed zone: {zone:?}"),
+        }
+    }
+
+    /// Runs `f` on another thread, failing after 5 s.
+    fn with_timeout<T: Send + 'static>(what: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap_or_else(|_| panic!("{what} did not return"))
+    }
+
+    #[test]
+    fn cache_shares_one_arc_across_path_spellings() {
+        if !std::path::Path::new(TOKYO).exists() {
+            return;
+        }
+        let dir = temp_dir("spell");
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        let path = dir.join("tz");
+        std::fs::copy(TOKYO, &path).unwrap();
+        std::os::unix::fs::symlink(&path, dir.join("link")).unwrap();
+        let d = dir.to_str().unwrap();
+        let spellings = [
+            format!("{d}/tz"),
+            format!("/{d}/tz"),
+            format!("{d}/./tz"),
+            format!(":{d}/tz"),
+            format!("{d}//tz"),
+            format!("{d}/sub/../tz"),
+            format!("{d}/link"),
+        ];
+        let mut cache = ZoneCache::new(8);
+        let first = cache.get(spellings[0].as_bytes());
+        assert_eq!(first, Zone::from_tz_bytes(spellings[0].as_bytes()));
+        assert_eq!(first.utc_offset_at(1_782_864_000), 9 * 3600);
+        for s in &spellings {
+            let zone = cache.get(s.as_bytes());
+            assert_eq!(zone, first, "{s}");
+            assert!(Arc::ptr_eq(file_arc(&zone), file_arc(&first)), "{s}");
+        }
+        assert_eq!(cache.file_entries(), 1);
+        assert_eq!(cache.entries.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_evicts_least_recently_used_entries() {
+        let values: Vec<String> = (0..20u8)
+            .map(|i| format!("X{}ST-{}", char::from(b'A' + i), i % 12))
+            .collect();
+        let mut cache = ZoneCache::new(4);
+        for v in &values {
+            assert_eq!(
+                cache.get(v.as_bytes()),
+                Zone::from_tz_bytes(v.as_bytes()),
+                "{v}"
+            );
+            assert!(cache.entries.len() <= 4);
+        }
+        assert_eq!(cache.entries.len(), 4);
+        // Keep an early value hot; it must survive further inserts.
+        let hot = values[16].as_bytes();
+        for v in &values[..8] {
+            cache.get(hot);
+            assert_eq!(
+                cache.get(v.as_bytes()),
+                Zone::from_tz_bytes(v.as_bytes()),
+                "{v}"
+            );
+            assert!(cache.entries.len() <= 4);
+        }
+        assert!(cache.entries.contains_key(&CacheKey::Posix(hot.to_vec())));
+        assert!(
+            !cache
+                .entries
+                .contains_key(&CacheKey::Posix(values[19].as_bytes().to_vec()))
+        );
+        for (i, v) in values.iter().enumerate() {
+            // "-N" in a POSIX string means N hours east of UTC.
+            let want = 3600 * (i as i32 % 12);
+            assert_eq!(cache.get(v.as_bytes()).utc_offset_at(0), want, "{v}");
+        }
+        // Capacity 0 stores nothing but still resolves.
+        let mut none = ZoneCache::new(0);
+        assert_eq!(none.get(b"EST5").utc_offset_at(0), -5 * 3600);
+        assert!(none.entries.is_empty());
+        assert_eq!(none.get(b":"), Zone::utc());
+    }
+
+    #[test]
+    fn cache_revalidates_zone_files() {
+        if !std::path::Path::new(TOKYO).exists() || !std::path::Path::new(PARIS).exists() {
+            return;
+        }
+        let dir = temp_dir("reval");
+        let path = dir.join("zone");
+        let value = path.to_str().unwrap().as_bytes().to_vec();
+        let mut cache = ZoneCache::new(8);
+
+        let missing = cache.get(&value);
+        assert_utc_like(&missing, path.to_str().unwrap());
+        assert_eq!(cache.get(&value), missing);
+
+        std::fs::copy(TOKYO, &path).unwrap();
+        let tokyo = cache.get(&value);
+        assert_eq!(tokyo.utc_offset_at(1_782_864_000), 9 * 3600);
+        assert_eq!(tokyo, Zone::from_tz_value(TOKYO));
+        assert!(Arc::ptr_eq(file_arc(&tokyo), file_arc(&cache.get(&value))));
+
+        // Replace with another zone under a new inode.
+        let tmp = dir.join("zone.new");
+        std::fs::copy(PARIS, &tmp).unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+        let paris = cache.get(&value);
+        assert_eq!(paris.utc_offset_at(1_782_864_000), 2 * 3600);
+        assert_eq!(paris, Zone::from_tz_value(PARIS));
+
+        // Rewrite in place (same inode): size and timestamps change.
+        std::fs::write(&path, std::fs::read(TOKYO).unwrap()).unwrap();
+        assert_eq!(cache.get(&value).utc_offset_at(1_782_864_000), 9 * 3600);
+
+        // Removed again: back to the POSIX fall-through.
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(cache.get(&value), missing);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_and_bytes_treat_non_regular_files_as_unreadable() {
+        let dir = temp_dir("nonreg");
+        let fifo = dir.join("fifo");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let values = [
+            "/dev/null".to_owned(),
+            "/dev/zero".to_owned(),
+            fifo.to_str().unwrap().to_owned(),
+            dir.to_str().unwrap().to_owned(),
+        ];
+        for value in values {
+            let v = value.clone();
+            let (cached, direct) = with_timeout(&value, move || {
+                let mut cache = ZoneCache::new(4);
+                let first = cache.get(v.as_bytes());
+                let again = cache.get(v.as_bytes());
+                assert_eq!(first, again);
+                (first, Zone::from_tz_bytes(v.as_bytes()))
+            });
+            assert_utc_like(&cached, &value);
+            assert_utc_like(&direct, &value);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fifo_without_writer_is_never_opened_for_reading() {
+        let dir = temp_dir("nowriter");
+        let fifo = dir.join("fifo");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let path = fifo.into_os_string();
+        // The first open carries no O_NONBLOCK: a read-open of a writer-less
+        // FIFO would block here. O_PATH returns at once and reports a FIFO.
+        let p = path.clone();
+        let kind = with_timeout("open_o_path(fifo)", move || {
+            let fd = open_o_path(&p).expect("O_PATH open");
+            std::fs::File::from(fd).metadata().unwrap().file_type()
+        });
+        assert!(std::os::unix::fs::FileTypeExt::is_fifo(&kind));
+        let p = path.clone();
+        let opened = with_timeout("open_zone(fifo)", move || open_zone(&p, PROC_FD_DIR));
+        assert!(matches!(opened, Opened::Unusable), "{opened:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_proc_fd_makes_files_unreadable() {
+        if !std::path::Path::new(TOKYO).exists() {
+            return;
+        }
+        let tokyo = OsStr::new(TOKYO);
+        assert!(matches!(open_zone(tokyo, PROC_FD_DIR), Opened::Bytes(..)));
+        let opened = open_zone(tokyo, "/nonexistent-proc/self/fd");
+        assert!(matches!(opened, Opened::Unusable), "{opened:?}");
+    }
+
+    #[test]
+    fn non_utf8_paths_resolve() {
+        if !std::path::Path::new(TOKYO).exists() {
+            return;
+        }
+        let dir = temp_dir("bytes");
+        let mut raw = dir.into_os_string().into_vec();
+        raw.extend_from_slice(b"/caf\xe9");
+        let path = OsString::from_vec(raw.clone());
+        std::fs::copy(TOKYO, &path).unwrap();
+        let zone = Zone::from_tz_bytes(&raw);
+        assert_eq!(zone, Zone::from_tz_value(TOKYO));
+        let mut colon = b":".to_vec();
+        colon.extend_from_slice(&raw);
+        assert_eq!(ZoneCache::new(2).get(&colon), zone);
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&path).parent().unwrap());
+    }
+
+    #[test]
+    fn files_over_one_mib_are_unreadable() {
+        assert_eq!(MAX_TZIF_BYTES, 1024 * 1024);
+        let dir = temp_dir("mib");
+        let path = dir.join("zone");
+        let mut bytes = std::fs::read(TOKYO).unwrap_or_default();
+        bytes.resize(MAX_TZIF_BYTES as usize + 1, 0);
+        std::fs::write(&path, &bytes).unwrap();
+        let value = path.to_str().unwrap().to_owned();
+        assert!(matches!(
+            open_zone(path.as_os_str(), PROC_FD_DIR),
+            Opened::Rejected(_)
+        ));
+        let v = value.clone();
+        let (direct, cached) = with_timeout(&value, move || {
+            let mut cache = ZoneCache::new(4);
+            let first = cache.get(v.as_bytes());
+            assert_eq!(cache.file_entries(), 1);
+            assert_eq!(cache.get(v.as_bytes()), first);
+            (Zone::from_tz_bytes(v.as_bytes()), first)
+        });
+        assert_utc_like(&direct, &value);
+        assert_utc_like(&cached, &value);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_matches_uncached_resolution() {
+        let mut cache = ZoneCache::new(3);
+        let values = [
+            "America/New_York",
+            ":Europe/Paris",
+            "posix/Asia/Tokyo",
+            "CET-1CEST",
+            "EST5EDT,M3.2.0,M11.1.0",
+            "Mars/Olympus",
+            "America",
+            "right/UTC",
+            "EST5\0junk",
+        ];
+        for _ in 0..3 {
+            for v in values {
+                assert_eq!(cache.get(v.as_bytes()), Zone::from_tz_value(v), "{v}");
             }
         }
     }

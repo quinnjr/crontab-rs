@@ -65,24 +65,29 @@ fn main() -> ExitCode {
     };
     let foreground = cli.foreground || cli.foreground_f || cli.run_at.is_some();
     let cfg = Config::from_env();
+    let mail_charset = mail_charset();
     let _ = cli.no_inotify;
 
     if !foreground && let Err(e) = nix::unistd::daemon(false, false) {
-        eprintln!("crond: can't daemonize: {e}");
+        let _ = writeln!(std::io::stderr(), "crond: can't daemonize: {e}");
         return ExitCode::FAILURE;
     }
     logging::init("crond", foreground, cli.debug.is_some());
 
-    let mailer = if cli.syslog_output {
-        Mailer::Off
+    // cronie: -s logs output to syslog and -m off discards it; otherwise mail
+    // through /usr/sbin/sendmail, or use syslog when it isn't installed.
+    let (mailer, syslog_output) = if cli.syslog_output {
+        (Mailer::Off, true)
     } else if let Some(m) = &cli.mail {
-        Mailer::from_arg(m)
+        (Mailer::from_arg(m), false)
     } else {
-        let detected = Mailer::detect();
-        if detected.is_off() {
-            log::info!("(CRON) INFO (No MTA installed, job output will be logged to syslog)");
+        match Mailer::detect() {
+            Mailer::Off => {
+                log::info!("(CRON) INFO (Syslog will be used instead of sendmail.)");
+                (Mailer::Off, true)
+            }
+            found => (found, false),
         }
-        detected
     };
     let hostname = nix::unistd::gethostname()
         .map(|h| h.to_string_lossy().into_owned())
@@ -92,6 +97,8 @@ fn main() -> ExitCode {
         default_shell: cfg.default_shell.clone(),
         inherit_path: cli.inherit_path,
         mailer,
+        syslog_output,
+        mail_charset,
         hostname,
     });
     let random_scale: f64 = rand::random();
@@ -211,4 +218,22 @@ fn main() -> ExitCode {
     drop(lock);
     let _ = std::fs::remove_file(&cfg.pid_file);
     ExitCode::SUCCESS
+}
+
+/// cronie's default mail charset: the codeset of the locale named by the
+/// environment (`setlocale(LC_ALL, "")` then `nl_langinfo(CODESET)`).
+fn mail_charset() -> String {
+    // SAFETY: called at startup before any other thread exists; the returned
+    // pointer is read immediately.
+    unsafe {
+        libc::setlocale(libc::LC_ALL, c"".as_ptr());
+        let codeset = libc::nl_langinfo(libc::CODESET);
+        if codeset.is_null() {
+            "US-ASCII".to_string()
+        } else {
+            std::ffi::CStr::from_ptr(codeset)
+                .to_string_lossy()
+                .into_owned()
+        }
+    }
 }

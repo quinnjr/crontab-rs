@@ -1,9 +1,9 @@
 //! The set of crontabs currently loaded from disk, and how to refresh it.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
-use std::io::{self, Read as _};
+use std::io::{self, Read as _, Write as _};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -12,10 +12,8 @@ use nix::unistd::{Uid, User};
 
 use crate::config::Config;
 use crate::crontab::{
-    Crontab, Diagnostic, EntryError, Format, MAX_USER_ENTRIES, MAX_USER_ENVS, ParseOptions,
-    inherited_process_env,
+    Crontab, Diagnostic, EntryError, Format, ParseOptions, inherited_process_env,
 };
-use crate::tz::Zone;
 
 /// `(mtime, ctime, ctime_nsec)` — identifies a specific version of a file's
 /// metadata, so a `chmod`/`chown` that leaves `mtime` alone (but bumps
@@ -43,9 +41,6 @@ pub struct LoadedTab {
     /// For spool crontabs, the owning user (who runs every entry).
     pub owner: Option<String>,
     pub crontab: Crontab,
-    /// Zones for the non-empty `CRON_TZ` values the entries use, resolved
-    /// when the file was loaded.
-    pub zones: HashMap<String, Zone>,
     /// Name used in log messages (user name or file path).
     pub label: String,
 }
@@ -58,10 +53,7 @@ pub struct Database {
     /// Uniform random factor in `[0, 1]` chosen once per daemon run.
     random_scale: f64,
     /// Variables inherited from the daemon's environment into every crontab.
-    inherited_env: Vec<(String, String)>,
-    /// Zones resolved during the current refresh, shared by the files it
-    /// loads so each `CRON_TZ` value is read once per pass.
-    zone_cache: HashMap<String, Zone>,
+    inherited_env: Vec<(Vec<u8>, Vec<u8>)>,
     /// Files that failed to load, with the metadata key they failed at, so
     /// errors are logged once per version of the file.
     bad: BTreeMap<PathBuf, MetaKey>,
@@ -106,7 +98,6 @@ impl Database {
             permissive,
             random_scale: random_scale.clamp(0.0, 1.0),
             inherited_env: inherited_process_env(),
-            zone_cache: HashMap::new(),
             bad: BTreeMap::new(),
             orphan_logged: BTreeMap::new(),
             tabs: BTreeMap::new(),
@@ -133,7 +124,6 @@ impl Database {
     /// Rescan all crontab locations.  Returns `true` when anything was
     /// added, removed or reloaded.
     pub fn refresh(&mut self) -> bool {
-        self.zone_cache.clear();
         let mut seen: Vec<PathBuf> = Vec::new();
         let mut changed = false;
 
@@ -371,25 +361,7 @@ impl Database {
         // cronie's load_user fails a user crontab outright at the first of:
         // too much comment/blank content, too many entries, too many variables.
         let limit = if format == Format::User {
-            [
-                parsed.diagnostics.iter().find_map(|d| match d {
-                    Diagnostic::TooMuchGarbage { line } => {
-                        Some((*line, "too many garbage characters"))
-                    }
-                    _ => None,
-                }),
-                parsed
-                    .entry_lines
-                    .get(MAX_USER_ENTRIES)
-                    .map(|l| (*l, "too many entries")),
-                parsed
-                    .env_lines
-                    .get(MAX_USER_ENVS)
-                    .map(|l| (*l, "too many environment variables")),
-            ]
-            .into_iter()
-            .flatten()
-            .min_by_key(|(line, _)| *line)
+            parsed.load_user_limit()
         } else {
             None
         };
@@ -408,7 +380,9 @@ impl Database {
             }
             match diagnostic {
                 // cronie's parser prints step warnings to stderr.
-                Diagnostic::Warning(w) => eprintln!("{w}"),
+                Diagnostic::Warning(w) => {
+                    let _ = writeln!(io::stderr(), "{w}");
+                }
                 Diagnostic::Error(e) => {
                     let msg = match e.error {
                         EntryError::PrematureEof => "missing newline before EOF".to_string(),
@@ -429,24 +403,6 @@ impl Database {
             return self.tabs.remove(path).is_some();
         }
 
-        let mut zones = HashMap::new();
-        for value in parsed
-            .crontab
-            .entries
-            .iter()
-            .filter_map(|e| e.cron_tz.as_deref())
-            .filter(|v| !v.is_empty())
-        {
-            if !zones.contains_key(value) {
-                let zone = self
-                    .zone_cache
-                    .entry(value.to_string())
-                    .or_insert_with(|| Zone::from_tz_value(value))
-                    .clone();
-                zones.insert(value.to_string(), zone);
-            }
-        }
-
         let verb = if self.tabs.contains_key(path) {
             "RELOAD"
         } else {
@@ -464,7 +420,6 @@ impl Database {
                 format,
                 owner,
                 crontab: parsed.crontab,
-                zones,
                 label,
             },
         );
@@ -575,7 +530,7 @@ mod tests {
         assert!(db.refresh());
         assert_eq!(db.random_scale(), 0.5);
         let tab = &db.tabs[&spool];
-        assert_eq!(tab.crontab.entries[0].command, "echo user2");
+        assert_eq!(tab.crontab.entries[0].command, b"echo user2");
         assert_eq!(
             tab.crontab.entries[0].random_delay,
             RandomDelay::Minutes(10)
@@ -587,13 +542,13 @@ mod tests {
         fs::write(&spool, "99 * * * * echo bad\n0 2 * * * echo good\n").unwrap();
         filetime_bump(&spool);
         assert!(db.refresh());
-        let commands: Vec<&str> = db.tabs[&spool]
+        let commands: Vec<&[u8]> = db.tabs[&spool]
             .crontab
             .entries
             .iter()
-            .map(|e| e.command.as_str())
+            .map(|e| e.command.as_slice())
             .collect();
-        assert_eq!(commands, vec!["echo good"]);
+        assert_eq!(commands, vec![b"echo good".as_slice()]);
         assert!(!db.refresh());
 
         // The system crontab and the user crontab (still holding its good

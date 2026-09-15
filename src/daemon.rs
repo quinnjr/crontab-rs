@@ -13,7 +13,8 @@ use chrono::NaiveDateTime;
 use crate::clock;
 use crate::crontab::{Entry, Format, RandomDelay};
 use crate::database::{Database, LoadedTab};
-use crate::job::Runner;
+use crate::job::{Runner, printable};
+use crate::tz::ZoneCache;
 
 /// Which jobs to consider for a minute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +34,9 @@ const MAX_CATCHUP: i64 = 5;
 
 /// Maximum number of concurrently running (or delayed) jobs overall.
 pub const MAX_JOBS_TOTAL: usize = 512;
+/// How many distinct `CRON_TZ` zones the scheduler keeps parsed.
+const ZONE_CACHE_CAPACITY: usize = 64;
+
 /// Maximum number of concurrently running (or delayed) jobs per user.
 pub const MAX_JOBS_PER_USER: usize = 64;
 
@@ -213,6 +217,9 @@ pub struct Scheduler {
     /// Apply `RANDOM_DELAY` offsets (disabled for one-shot runs).
     pub honor_delay: bool,
     slots: JobSlots,
+    /// `CRON_TZ` zones, keyed by the zone file's identity and revalidated on
+    /// every lookup, as glibc re-reads a changed TZ file.
+    zones: Mutex<ZoneCache>,
     /// Last `.cron.hostname` read error kind, so it is logged once per change.
     cluster_err: Mutex<Option<io::ErrorKind>>,
     /// Jobs that could not be started (thread spawn failure or over cap).
@@ -227,6 +234,7 @@ impl Scheduler {
             cluster,
             honor_delay,
             slots: JobSlots::new(MAX_JOBS_TOTAL, MAX_JOBS_PER_USER),
+            zones: Mutex::new(ZoneCache::new(ZONE_CACHE_CAPACITY)),
             cluster_err: Mutex::new(None),
             dispatch_failures: AtomicUsize::new(0),
         }
@@ -259,24 +267,33 @@ impl Scheduler {
         cluster_allows(true, &read, &self.runner.hostname)
     }
 
-    fn job_user(tab: &LoadedTab, entry: &Entry) -> Option<String> {
-        entry.user.clone().or_else(|| tab.owner.clone())
+    fn job_user(tab: &LoadedTab, entry: &Entry) -> Option<Vec<u8>> {
+        entry
+            .user
+            .clone()
+            .or_else(|| tab.owner.as_ref().map(|o| o.as_bytes().to_vec()))
     }
 
     fn dispatch(&self, tab: &LoadedTab, entry: &Entry) -> Option<JoinHandle<bool>> {
         let user = Self::job_user(tab, entry)?;
-        let Some(slot) = self.slots.try_acquire(&user) else {
-            log::error!(
-                "({user}) ERROR (too many running jobs; job skipped: {})",
-                entry.raw_command
-            );
+        let user_name = String::from_utf8_lossy(&user).into_owned();
+        let Some(slot) = self.slots.try_acquire(&user_name) else {
+            // A job hidden from the log (leading `-`) never has its command logged.
+            if entry.dont_log {
+                log::error!("({user_name}) ERROR (too many running jobs; job skipped)");
+            } else {
+                log::error!(
+                    "({user_name}) ERROR (too many running jobs; job skipped: {})",
+                    printable(&entry.command)
+                );
+            }
             self.dispatch_failures.fetch_add(1, Ordering::Relaxed);
             return None;
         };
         let runner = Arc::clone(&self.runner);
         let entry = entry.clone();
         let spawned = std::thread::Builder::new()
-            .name(format!("job-{user}"))
+            .name(format!("job-{user_name}"))
             .spawn(move || {
                 let _slot = slot;
                 // Runner::run logs its own failures.
@@ -354,11 +371,15 @@ impl Scheduler {
                     // cronie skips jobs with CRON_TZ set, even to an empty
                     // value, while the local UTC offset is changing.
                     Some(_) if v_gmtoff != gmtoff => continue,
-                    Some("") => clock::wall_time(at),
-                    Some(value) => match tab.zones.get(value) {
-                        Some(zone) => clock::wall_time_in_tz(at, v_gmtoff, zone),
-                        None => continue,
-                    },
+                    Some([]) => clock::wall_time(at),
+                    Some(value) => {
+                        let zone = self
+                            .zones
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get(value);
+                        clock::wall_time_in_tz(at, v_gmtoff, &zone)
+                    }
                 };
                 if entry.schedule.matches(&t) {
                     handles.extend(self.dispatch(tab, entry));
@@ -598,6 +619,8 @@ mod tests {
             default_shell: cfg.default_shell.clone(),
             inherit_path: false,
             mailer: Mailer::Off,
+            syslog_output: false,
+            mail_charset: "US-ASCII".into(),
             hostname: hostname.clone(),
         });
         let sched = Scheduler::new(db, runner, true, false);
@@ -659,6 +682,8 @@ mod tests {
             default_shell: cfg.default_shell.clone(),
             inherit_path: false,
             mailer: Mailer::Off,
+            syslog_output: false,
+            mail_charset: "US-ASCII".into(),
             hostname: "h".into(),
         });
         let sched = Scheduler::new(db, runner, false, true);
@@ -703,6 +728,8 @@ mod tests {
             default_shell: cfg.default_shell.clone(),
             inherit_path: false,
             mailer: Mailer::Off,
+            syslog_output: false,
+            mail_charset: "US-ASCII".into(),
             hostname: "h".into(),
         });
         let sched = Scheduler::new(db, runner, false, false);
@@ -745,6 +772,8 @@ mod tests {
             default_shell: cfg.default_shell.clone(),
             inherit_path: false,
             mailer: Mailer::Off,
+            syslog_output: false,
+            mail_charset: "US-ASCII".into(),
             hostname: "h".into(),
         });
         let sched = Scheduler::new(db, runner, false, false);

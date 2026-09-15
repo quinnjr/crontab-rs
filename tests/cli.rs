@@ -494,25 +494,31 @@ fn syntax_check_stops_at_first_error() {
 }
 
 #[test]
-fn u_flag_conflicts_with_test_and_cluster_options() {
+fn u_flag_rules_follow_option_order() {
     if !nix::unistd::geteuid().is_root() {
         return;
     }
     let env = Env::new();
-    let o = env.crontab(&["-u", "nobody", "-T", "-"], Some("0 0 * * * x\n"));
+    // -T before -u is refused; -u before -T checks the file as that user.
+    let o = env.crontab(&["-T", "-", "-u", "nobody"], Some("0 0 * * * x\n"));
     assert!(!o.status.success());
     assert!(
         stderr(&o).contains("cannot use -u with -n, -c or -T"),
         "{}",
         stderr(&o)
     );
-    let o = env.crontab(&["-u", "nobody", "-c"], None);
+    let o = env.crontab(&["-u", "nobody", "-T", "-"], Some("-* * * * * x\n"));
     assert!(!o.status.success());
+    assert!(stderr(&o).contains("bad option"), "{}", stderr(&o));
+    // -c after -u is refused only for a different user.
+    let o = env.crontab(&["-u", "nobody", "-c"], None);
     assert!(
         stderr(&o).contains("cannot use -u with -n or -c"),
         "{}",
         stderr(&o)
     );
+    let o = env.crontab(&["-u", "root", "-c"], None);
+    assert!(!stderr(&o).contains("cannot use -u"), "{}", stderr(&o));
 }
 
 /// Wait for a child, killing it and failing the test after `secs` seconds.
@@ -869,4 +875,124 @@ fn crond_reboot_jobs_once_and_signals() {
     std::thread::sleep(Duration::from_millis(1500));
     assert!(stop(&mut child).success());
     assert_eq!(fs::read_to_string(&out).unwrap(), "up\n");
+}
+
+#[test]
+fn crond_logs_escaped_command_without_stdin_text() {
+    let env = Env::new();
+    let out = env.path("secret-out");
+    fs::write(
+        env.path("cron.d").join("secret"),
+        format!("* * * * * {} cat > {}%hunter2\n", me(), out.display()),
+    )
+    .unwrap();
+    let o = env
+        .crond()
+        .args(["-p", "-s", "--run-at", "2026-01-01 00:00"])
+        .output()
+        .unwrap();
+    let err = stderr(&o);
+    assert!(o.status.success(), "{err}");
+    assert!(
+        err.contains(&format!("CMD (cat > {})", out.display())),
+        "{err}"
+    );
+    assert!(
+        !err.contains("hunter2"),
+        "stdin text must not be logged: {err}"
+    );
+    assert_eq!(fs::read_to_string(&out).unwrap(), "hunter2\n");
+}
+
+#[test]
+fn syslog_output_only_with_s() {
+    let env = Env::new();
+    fs::write(
+        env.path("cron.d").join("talk"),
+        format!("* * * * * {} echo said-something\n", me()),
+    )
+    .unwrap();
+    let o = env
+        .crond()
+        .args(["-p", "-s", "--run-at", "2026-01-01 00:00"])
+        .output()
+        .unwrap();
+    assert!(
+        stderr(&o).contains("CMDOUT (said-something)"),
+        "{}",
+        stderr(&o)
+    );
+    let o = env
+        .crond()
+        .args(["-p", "-m", "off", "--run-at", "2026-01-01 00:00"])
+        .output()
+        .unwrap();
+    assert!(
+        !stderr(&o).contains("CMDOUT"),
+        "-m off discards output: {}",
+        stderr(&o)
+    );
+}
+
+#[test]
+fn jobs_start_in_crontab_home_and_skip_when_chdir_fails() {
+    let env = Env::new();
+    let home = env.path("apphome");
+    fs::create_dir(&home).unwrap();
+    let out = env.path("pwd-out");
+    let skipped = env.path("ran-without-home");
+    fs::write(
+        env.path("cron.d").join("home"),
+        format!(
+            "HOME={home}\n* * * * * {me} pwd > {out}\nHOME={home}/missing\n* * * * * {me} touch {skipped}\n",
+            home = home.display(),
+            me = me(),
+            out = out.display(),
+            skipped = skipped.display()
+        ),
+    )
+    .unwrap();
+    let o = env
+        .crond()
+        .args(["-p", "-s", "--run-at", "2026-01-01 00:00"])
+        .output()
+        .unwrap();
+    let err = stderr(&o);
+    assert_eq!(
+        fs::read_to_string(&out).unwrap().trim(),
+        home.display().to_string()
+    );
+    assert!(!skipped.exists(), "{err}");
+    assert!(err.contains("ERROR chdir failed ("), "{err}");
+    assert!(!o.status.success());
+}
+
+#[test]
+fn mail_follows_cronie_headers_and_safety_rules() {
+    let env = Env::new();
+    let mbox = env.path("mbox");
+    fs::write(
+        env.path("cron.d").join("mail"),
+        format!(
+            "MAILFROM=\"bad sender\"\nMAILTO=alice\n* * * * * {me} echo body-text\nMAILTO=\"eve;rm\"\n* * * * * {me} echo unsafe-mailto\n",
+            me = me()
+        ),
+    )
+    .unwrap();
+    let o = env
+        .crond()
+        .args(["-p", "-m", &format!("cat >> '{}'", mbox.display())])
+        .args(["--run-at", "2026-01-01 00:00"])
+        .output()
+        .unwrap();
+    let err = stderr(&o);
+    let mail = fs::read_to_string(&mbox).unwrap();
+    assert!(
+        mail.contains(&format!("From: \"(Cron Daemon)\" <{}>\n", me())),
+        "an unsafe MAILFROM falls back to the user: {mail}"
+    );
+    assert!(mail.contains("To: alice\n"), "{mail}");
+    assert!(mail.contains("\n\nbody-text\n"), "{mail}");
+    assert!(!mail.contains("unsafe-mailto"), "{mail}");
+    assert!(err.contains("UNSAFE (bad sender)"), "{err}");
 }

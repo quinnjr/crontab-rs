@@ -5,19 +5,33 @@ use std::process::ExitCode;
 
 use clap::error::ErrorKind;
 
-/// Parse arguments with cronie's exit statuses: the version goes to stdout
-/// with status 0; help and usage errors go to stderr with status 1. Write
-/// errors (a closed pipe, a full disk) are ignored rather than panicking.
+/// Report a clap error with cronie's exit statuses: the version goes to
+/// stdout with status 0; help and usage errors go to stderr with status 1.
+/// Write errors (a closed pipe, a full disk) are ignored rather than
+/// panicking.
+fn report(e: clap::Error) -> ExitCode {
+    if e.kind() == ErrorKind::DisplayVersion {
+        let _ = e.print();
+        ExitCode::SUCCESS
+    } else {
+        let _ = write!(std::io::stderr(), "{e}");
+        ExitCode::FAILURE
+    }
+}
+
+/// Parse arguments with cronie's exit statuses (see [`report`]).
 pub fn parse_args<P: clap::Parser>() -> Result<P, ExitCode> {
-    P::try_parse().map_err(|e| {
-        if e.kind() == ErrorKind::DisplayVersion {
-            let _ = e.print();
-            ExitCode::SUCCESS
-        } else {
-            let _ = write!(std::io::stderr(), "{e}");
-            ExitCode::FAILURE
-        }
-    })
+    P::try_parse().map_err(report)
+}
+
+/// Like [`parse_args`], also returning the raw matches so callers can tell
+/// the order options were given in (cronie applies some checks in `getopt`
+/// order).
+pub fn parse_args_with_matches<P: clap::Parser>() -> Result<(P, clap::ArgMatches), ExitCode> {
+    P::command()
+        .try_get_matches()
+        .and_then(|m| P::from_arg_matches(&m).map(|p| (p, m)))
+        .map_err(report)
 }
 
 /// cronie refuses to read a new crontab from a terminal when no file (or

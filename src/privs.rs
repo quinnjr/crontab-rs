@@ -80,9 +80,21 @@ impl Creds {
     }
 }
 
+/// Added to the errno of a failed `chdir` into the working directory, so a
+/// spawn error caused by it can be told apart (see [`chdir_failure`]).
+pub const CHDIR_FAILED_BASE: i32 = 0x1000_0000;
+
+/// If `e` is a spawn error caused by the child's `chdir` into its working
+/// directory, the underlying OS error.
+pub fn chdir_failure(e: &io::Error) -> Option<io::Error> {
+    let code = e.raw_os_error()?;
+    (code >= CHDIR_FAILED_BASE).then(|| io::Error::from_raw_os_error(code - CHDIR_FAILED_BASE))
+}
+
 /// Arrange for `cmd` to optionally start a new session, assume `creds`
 /// (supplementary groups, gid, then uid, verified afterwards) and change to
-/// `workdir` (falling back to `/`) before exec.
+/// `workdir` before exec. As in cronie, a failed `chdir` stops the child:
+/// the spawn fails with an error recognised by [`chdir_failure`].
 ///
 /// Fails closed: when this process is a set-ID binary, `creds` is mandatory.
 pub fn configure_child(
@@ -140,9 +152,9 @@ pub fn configure_child(
             }
             if let Some(dir) = &workdir
                 && libc::chdir(dir.as_ptr()) != 0
-                && libc::chdir(c"/".as_ptr()) != 0
             {
-                return Err(io::Error::last_os_error());
+                let errno = *libc::__errno_location();
+                return Err(io::Error::from_raw_os_error(CHDIR_FAILED_BASE + errno));
             }
             Ok(())
         });
@@ -184,7 +196,6 @@ pub fn gid(raw: u32) -> Gid {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Stdio;
 
     #[test]
     fn as_real_user_calls_closure_once() {
@@ -213,18 +224,24 @@ mod tests {
     }
 
     #[test]
-    fn missing_workdir_falls_back_to_root() {
+    fn failed_chdir_stops_the_child() {
         let mut cmd = Command::new("/bin/sh");
-        cmd.arg("-c").arg("pwd").stdout(Stdio::piped());
+        cmd.arg("-c").arg("pwd");
         configure_child(
             &mut cmd,
             Some(Creds::real_user().unwrap()),
             false,
-            Some("/nonexistent-crond-test-dir".into()),
+            Some(PathBuf::from("/nonexistent-workdir-xyz")),
         )
         .unwrap();
-        let out = cmd.output().unwrap();
-        assert!(out.status.success());
-        assert_eq!(out.stdout, b"/\n");
+        let err = cmd.output().unwrap_err();
+        let cause = chdir_failure(&err).expect("recognised as a chdir failure");
+        assert_eq!(cause.raw_os_error(), Some(libc::ENOENT));
+        assert!(chdir_failure(&io::Error::from_raw_os_error(libc::ENOENT)).is_none());
+
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("pwd");
+        configure_child(&mut cmd, None, false, Some(PathBuf::from("/tmp"))).unwrap();
+        assert_eq!(cmd.output().unwrap().stdout, b"/tmp\n");
     }
 }

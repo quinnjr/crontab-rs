@@ -12,9 +12,7 @@ use nix::unistd::{User, chown, getuid};
 
 use crontab_rs::allow::user_allowed;
 use crontab_rs::config::{Config, is_privileged_binary};
-use crontab_rs::crontab::{
-    Crontab, Diagnostic, Format, MAX_USER_ENTRIES, MAX_USER_ENVS, ParseOptions, ParseOutput,
-};
+use crontab_rs::crontab::{Crontab, Diagnostic, Format, ParseOptions, ParseOutput};
 use crontab_rs::privs::{Creds, as_real_user, configure_child, gid, is_root};
 
 #[derive(Parser, Debug)]
@@ -64,8 +62,8 @@ fn main() -> ExitCode {
     // files) is private; never inherit a permissive umask from the caller.
     umask(Mode::from_bits_truncate(0o077));
 
-    let cli = match crontab_rs::cli::parse_args::<Cli>() {
-        Ok(cli) => cli,
+    let (cli, matches) = match crontab_rs::cli::parse_args_with_matches::<Cli>() {
+        Ok(parsed) => parsed,
         Err(code) => return code,
     };
     let cfg = Config::from_env();
@@ -90,28 +88,18 @@ fn main() -> ExitCode {
         Err(e) => return fail(format!("can't look up UID {}: {e}", real_uid.as_raw())),
     };
 
+    // cronie checks -u, -n, -c and -T as getopt meets them, so the order
+    // they were given in matters.
+    if let Some(message) = option_order_error(&cli, &matches, &me.name, real_uid.is_root()) {
+        eprintln!("{message}");
+        return ExitCode::FAILURE;
+    }
     let target = match &cli.user {
         None => me.clone(),
-        Some(name) => {
-            // cronie: -u needs root, even for your own name, and can't be
-            // combined with -T, -n or -c.
-            if !real_uid.is_root() {
-                eprintln!("must be privileged to use -u");
-                return ExitCode::FAILURE;
-            }
-            if cli.test {
-                eprintln!("cannot use -u with -n, -c or -T");
-                return ExitCode::FAILURE;
-            }
-            if cli.set_host.is_some() || cli.show_host {
-                eprintln!("cannot use -u with -n or -c");
-                return ExitCode::FAILURE;
-            }
-            match User::from_name(name) {
-                Ok(Some(u)) => u,
-                _ => return fail(format!("user `{name}' unknown")),
-            }
-        }
+        Some(name) => match User::from_name(name) {
+            Ok(Some(u)) => u,
+            _ => return fail(format!("user `{name}' unknown")),
+        },
     };
 
     if !user_allowed(&cfg, &me.name, real_uid.as_raw()) {
@@ -137,10 +125,6 @@ fn main() -> ExitCode {
     }
 
     if let Some(host) = &cli.set_host {
-        if !real_uid.is_root() {
-            eprintln!("must be privileged to set host with -n");
-            return ExitCode::FAILURE;
-        }
         let path = cfg.spool_dir.join(".cron.hostname");
         let r = if host.is_empty() {
             fs::remove_file(&path).or_else(|e| {
@@ -227,6 +211,67 @@ fn main() -> ExitCode {
 
 /// Read a file (as the invoking user, so a set-uid binary cannot be used to
 /// read files the caller couldn't) or stdin for `-`.
+/// cronie's `parse_args` checks for `-u`, `-n`, `-c` and `-T`, applied in
+/// the order the options appeared on the command line.
+fn option_order_error(
+    cli: &Cli,
+    matches: &clap::ArgMatches,
+    me: &str,
+    root: bool,
+) -> Option<&'static str> {
+    #[derive(Clone, Copy)]
+    enum Opt {
+        User,
+        SetHost,
+        ShowHost,
+        Test,
+    }
+    let mut seen: Vec<(usize, Opt)> = [
+        ("user", Opt::User),
+        ("set_host", Opt::SetHost),
+        ("show_host", Opt::ShowHost),
+        ("test", Opt::Test),
+    ]
+    .into_iter()
+    .filter_map(|(id, opt)| matches.index_of(id).map(|i| (i, opt)))
+    .collect();
+    seen.sort_by_key(|(i, _)| *i);
+
+    let other_user = cli.user.as_deref().is_some_and(|u| u != me);
+    let mut user_given = false;
+    let mut operation_given = false;
+    for (_, opt) in seen {
+        match opt {
+            Opt::User => {
+                if !root {
+                    return Some("must be privileged to use -u");
+                }
+                if operation_given {
+                    return Some("cannot use -u with -n, -c or -T");
+                }
+                user_given = true;
+            }
+            Opt::SetHost => {
+                if !root {
+                    return Some("must be privileged to set host with -n");
+                }
+                if user_given && other_user {
+                    return Some("cannot use -u with -n or -c");
+                }
+                operation_given = true;
+            }
+            Opt::ShowHost => {
+                if user_given && other_user {
+                    return Some("cannot use -u with -n or -c");
+                }
+                operation_given = true;
+            }
+            Opt::Test => operation_given = true,
+        }
+    }
+    None
+}
+
 fn read_input(source: &str) -> io::Result<Vec<u8>> {
     if source == "-" {
         let mut buf = Vec::new();
@@ -267,22 +312,8 @@ fn check_syntax(source: &str, text: &[u8], target: &User) -> bool {
             Diagnostic::BadRandomDelay { .. } => {}
         }
     }
-    let before_stop = |line: usize| parsed.first_error_line().is_none_or(|stop| line < stop);
-    let envs = parsed.env_lines.iter().filter(|l| before_stop(**l)).count();
-    if envs > MAX_USER_ENVS {
-        eprintln!(
-            "There are too many environment variables in the crontab file. Limit: {MAX_USER_ENVS}"
-        );
-        return false;
-    }
-    let entries = parsed
-        .crontab
-        .entries
-        .iter()
-        .filter(|e| before_stop(e.line))
-        .count();
-    if entries > MAX_USER_ENTRIES {
-        eprintln!("There are too many entries in the crontab file. Limit: {MAX_USER_ENTRIES}");
+    if let Some(message) = parsed.check_syntax_limit() {
+        eprintln!("{message}");
         return false;
     }
     valid

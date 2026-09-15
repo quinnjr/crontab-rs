@@ -81,9 +81,10 @@ where no job was due, exits zero.
   DST rules all work, and an unknown value means UTC. An empty `CRON_TZ` means
   the daemon's local time. Jobs with `CRON_TZ` set, even to an empty value, are
   skipped while the local UTC offset is changing, as in cronie.
-- Only `crond` reads zone files, never `crontab`. FIFOs, devices and oversized
-  files are treated as unreadable, and set-ID programs get glibc's path
-  restrictions.
+- Only `crond` reads zone files, never `crontab`. Zones are cached by file
+  identity and rechecked on every use, so tzdata updates apply at once. FIFOs,
+  devices and files over 1 MiB are treated as unreadable without being opened
+  for reading, and set-ID programs get glibc's path restrictions.
 - `RANDOM_DELAY` makes a job run that many minutes (scaled by a random factor
   chosen at startup) after its scheduled time, as cronie does. An out-of-range
   value is logged by the daemon and ignored.
@@ -103,8 +104,9 @@ where no job was due, exits zero.
 - cronie's limits apply: 1000 variables, 10000 entries, 32768 characters of
   comments and blank space between lines, and 131072-byte fields. `crontab`
   refuses a file over them and `crond` does not load such a user crontab.
-- `-u` requires root, even for your own name, and cannot be combined with `-T`,
-  `-n` or `-c`. Without a file argument, `crontab` refuses to read a new
+- `-u` requires root, even for your own name. As in cronie, it is refused after
+  `-T`, `-n` or `-c`, while `-n` and `-c` after `-u` are refused only for another
+  user; `-u` before `-T` checks the file as that user. Without a file argument, `crontab` refuses to read a new
   crontab from a terminal.
 - System crontab user field. `cron.d` skips `*.rpmsave`, `*.pacnew`, `*~` and
   other package-manager leftovers.
@@ -115,8 +117,15 @@ where no job was due, exits zero.
   session, with `HOME` as the working directory. Each job gets a clean
   environment: `SHELL`, `PATH`, `HOME`, `LOGNAME` and `USER`, plus crontab
   variables.
-- Stdout and stderr are combined and mailed with sendmail (auto-detected) or
-  the `-m` command. With no mailer, output is logged as `CMDOUT`.
+- Stdout and stderr are combined and mailed through `/usr/sbin/sendmail` or the
+  `-m` command, with cronie's headers. `-s`, or no sendmail installed, logs each
+  output line as `CMDOUT` instead; `-m off` discards output. `$NAME` and
+  `${NAME}` in `MAILTO` and `MAILFROM` expand from crond's own environment. An
+  unsafe `MAILTO` sends no mail, and an unsafe `MAILFROM` falls back to the
+  account name.
+- Jobs start in the job environment's `HOME`, which a crontab may set, and are
+  skipped if that directory can't be entered. `CMD` and `CMDEND` log lines show
+  the command without its `%` input, escaped as cronie does.
 - Clock handling follows Vixie cron. Gaps of up to 5 minutes are replayed. When
   the clock jumps forward by up to 3 hours, such as at DST start, fixed-time jobs
   run once and wildcard jobs run for the current minute. When the clock goes back

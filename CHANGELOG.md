@@ -35,3 +35,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A library exposing the `crontab` and `schedule` modules as its stable API.
 - A systemd unit, a sample `cron.d` hourly file, and a README.
 - Unit and end-to-end test suites.
+- Dual MIT and Apache-2.0 licensing, with `LICENSE-MIT` and `LICENSE-APACHE`.

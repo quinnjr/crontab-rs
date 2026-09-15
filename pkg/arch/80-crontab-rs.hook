@@ -1,0 +1,10 @@
+[Trigger]
+Operation = Upgrade
+Type = Package
+Target = glibc
+Target = crontab-rs
+
+[Action]
+Description = Restarting crond for glibc or crontab-rs upgrade...
+When = PostTransaction
+Exec = /usr/share/libalpm/scripts/systemd-hook restart crond.service

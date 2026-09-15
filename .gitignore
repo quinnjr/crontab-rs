@@ -1,2 +1,7 @@
 /target
 .worktrees/
+/pkg/arch/src/
+/pkg/arch/pkg/
+/pkg/arch/*.tar.gz
+/pkg/arch/*.pkg.tar.*
+/pkg/arch/*.log

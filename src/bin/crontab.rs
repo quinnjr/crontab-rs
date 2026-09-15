@@ -1,7 +1,7 @@
 //! `crontab` — install, list, edit and remove per-user crontabs.
 
 use std::fs;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::Path;
 use std::process::{Command, ExitCode};
@@ -12,7 +12,9 @@ use nix::unistd::{User, chown, getuid};
 
 use crontab_rs::allow::user_allowed;
 use crontab_rs::config::{Config, is_privileged_binary};
-use crontab_rs::crontab::{Crontab, Diagnostic, Format, ParseOptions, ParseOutput};
+use crontab_rs::crontab::{
+    Crontab, Diagnostic, Format, MAX_USER_ENTRIES, MAX_USER_ENVS, ParseOptions, ParseOutput,
+};
 use crontab_rs::privs::{Creds, as_real_user, configure_child, gid, is_root};
 
 #[derive(Parser, Debug)]
@@ -73,6 +75,13 @@ fn main() -> ExitCode {
     if !file_action && cli.file.is_some() {
         return fail("a file argument cannot be combined with -l, -r, -e, -n or -c");
     }
+    // cronie won't read a new crontab from a terminal without an explicit `-`.
+    if file_action
+        && crontab_rs::cli::stdin_file_required(cli.file.as_deref(), io::stdin().is_terminal())
+    {
+        eprintln!("crontab: usage error: file name or - (for stdin) must be specified");
+        return ExitCode::FAILURE;
+    }
 
     let real_uid = getuid();
     let me = match User::from_uid(real_uid) {
@@ -84,8 +93,19 @@ fn main() -> ExitCode {
     let target = match &cli.user {
         None => me.clone(),
         Some(name) => {
-            if !real_uid.is_root() && *name != me.name {
-                return fail("must be privileged to use -u");
+            // cronie: -u needs root, even for your own name, and can't be
+            // combined with -T, -n or -c.
+            if !real_uid.is_root() {
+                eprintln!("must be privileged to use -u");
+                return ExitCode::FAILURE;
+            }
+            if cli.test {
+                eprintln!("cannot use -u with -n, -c or -T");
+                return ExitCode::FAILURE;
+            }
+            if cli.set_host.is_some() || cli.show_host {
+                eprintln!("cannot use -u with -n or -c");
+                return ExitCode::FAILURE;
             }
             match User::from_name(name) {
                 Ok(Some(u)) => u,
@@ -118,7 +138,8 @@ fn main() -> ExitCode {
 
     if let Some(host) = &cli.set_host {
         if !real_uid.is_root() {
-            return fail("must be privileged to set the cluster host");
+            eprintln!("must be privileged to set host with -n");
+            return ExitCode::FAILURE;
         }
         let path = cfg.spool_dir.join(".cron.hostname");
         let r = if host.is_empty() {
@@ -206,29 +227,28 @@ fn main() -> ExitCode {
 
 /// Read a file (as the invoking user, so a set-uid binary cannot be used to
 /// read files the caller couldn't) or stdin for `-`.
-fn read_input(source: &str) -> io::Result<String> {
-    let bytes = if source == "-" {
+fn read_input(source: &str) -> io::Result<Vec<u8>> {
+    if source == "-" {
         let mut buf = Vec::new();
         io::stdin().lock().read_to_end(&mut buf)?;
-        buf
+        Ok(buf)
     } else {
-        as_real_user(|| fs::read(source))?
-    };
-    String::from_utf8(bytes)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "not valid UTF-8"))
+        as_real_user(|| fs::read(source))
+    }
 }
 
-/// Parse `text` as `target`'s crontab.
-fn parse_for(text: &str, target: &User) -> ParseOutput {
+/// Parse `text` as `target`'s crontab. Crontabs need not be UTF-8.
+fn parse_for(text: &[u8], target: &User) -> ParseOutput {
     let options = ParseOptions::new(Format::User)
         .privileged(target.uid.is_root())
         .inherit_process_env();
-    Crontab::parse_with(text, &options)
+    Crontab::parse_bytes(text, &options)
 }
 
 /// cronie's `check_syntax`: print warnings and the first error, stopping
-/// there. Returns true when the crontab has no error.
-fn check_syntax(source: &str, text: &str, target: &User) -> bool {
+/// there, then check the entry and variable limits on what was read.
+/// Returns true when the crontab can be installed.
+fn check_syntax(source: &str, text: &[u8], target: &User) -> bool {
     let parsed = parse_for(text, target);
     let mut valid = true;
     for diagnostic in parsed.until_first_error() {
@@ -238,7 +258,32 @@ fn check_syntax(source: &str, text: &str, target: &User) -> bool {
                 eprintln!("\"{source}\":{}: {}", e.line, e.error);
                 valid = false;
             }
+            Diagnostic::TooMuchGarbage { line } => {
+                eprintln!(
+                    "\"{source}\":{line}: too much non-parseable content (comments, empty lines, spaces)"
+                );
+                valid = false;
+            }
+            Diagnostic::BadRandomDelay { .. } => {}
         }
+    }
+    let before_stop = |line: usize| parsed.first_error_line().is_none_or(|stop| line < stop);
+    let envs = parsed.env_lines.iter().filter(|l| before_stop(**l)).count();
+    if envs > MAX_USER_ENVS {
+        eprintln!(
+            "There are too many environment variables in the crontab file. Limit: {MAX_USER_ENVS}"
+        );
+        return false;
+    }
+    let entries = parsed
+        .crontab
+        .entries
+        .iter()
+        .filter(|e| before_stop(e.line))
+        .count();
+    if entries > MAX_USER_ENTRIES {
+        eprintln!("There are too many entries in the crontab file. Limit: {MAX_USER_ENTRIES}");
+        return false;
     }
     valid
 }
@@ -249,7 +294,7 @@ fn test_file(source: &str, target: &User) -> ExitCode {
         Err(e) => return fail(format!("{source}: {e}")),
     };
     if check_syntax(source, &text, target) {
-        println!("No syntax issues were found in the crontab file.");
+        eprintln!("No syntax issues were found in the crontab file.");
         ExitCode::SUCCESS
     } else {
         eprintln!("Invalid crontab file. Syntax issues were found.");
@@ -265,7 +310,7 @@ fn touch_spool(cfg: &Config) {
 }
 
 /// Atomically replace the user's spool file.
-fn install(cfg: &Config, target: &User, text: &str) -> io::Result<()> {
+fn install(cfg: &Config, target: &User, text: &[u8]) -> io::Result<()> {
     if !cfg.spool_dir.is_dir() {
         if is_root() {
             fs::DirBuilder::new()
@@ -283,7 +328,7 @@ fn install(cfg: &Config, target: &User, text: &str) -> io::Result<()> {
     let mut tmp = tempfile::Builder::new()
         .prefix(&format!(".tmp.{}.", target.name))
         .tempfile_in(&cfg.spool_dir)?;
-    tmp.write_all(text.as_bytes())?;
+    tmp.write_all(text)?;
     tmp.as_file().sync_all()?;
     tmp.as_file()
         .set_permissions(fs::Permissions::from_mode(0o600))?;
@@ -362,11 +407,11 @@ impl EditOutcome {
 }
 
 fn edit(cfg: &Config, me: &User, target: &User, spool_file: &Path) -> ExitCode {
-    let original = match fs::read_to_string(spool_file) {
+    let original = match fs::read(spool_file) {
         Ok(t) => t,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             eprintln!("no crontab for {} - using an empty one", target.name);
-            String::new()
+            Vec::new()
         }
         Err(e) => return fail(format!("{}: {e}", spool_file.display())),
     };
@@ -388,7 +433,7 @@ fn edit(cfg: &Config, me: &User, target: &User, spool_file: &Path) -> ExitCode {
         } else {
             builder.tempfile()?
         };
-        t.write_all(original.as_bytes())?;
+        t.write_all(&original)?;
         t.flush()?;
         Ok(t.into_temp_path())
     }) {
@@ -413,7 +458,7 @@ fn edit(cfg: &Config, me: &User, target: &User, spool_file: &Path) -> ExitCode {
 fn edit_session(
     cfg: &Config,
     target: &User,
-    original: &str,
+    original: &[u8],
     tmp_path: &Path,
     creds: &Creds,
 ) -> EditOutcome {
@@ -440,7 +485,7 @@ fn edit_session(
             }
         }
 
-        let edited = match as_real_user(|| fs::read_to_string(tmp_path)) {
+        let edited = match as_real_user(|| fs::read(tmp_path)) {
             Ok(t) => t,
             Err(e) => {
                 return EditOutcome::keep(fail(format!("can't read edited file: {e}")));
@@ -454,12 +499,17 @@ fn edit_session(
         if check_syntax(&tmp_path.display().to_string(), &edited, target) {
             return match install(cfg, target, &edited) {
                 Ok(()) => EditOutcome::done(ExitCode::SUCCESS),
-                Err(e) => EditOutcome::keep(fail(format!("installing new crontab failed: {e}"))),
+                // cronie abandons the edit and still exits 0.
+                Err(e) => {
+                    eprintln!("crontab: installing new crontab failed: {e}");
+                    EditOutcome::keep(ExitCode::SUCCESS)
+                }
             };
         }
         eprintln!("Invalid crontab file, can't install.");
         if !ask_retry() {
-            return EditOutcome::keep(ExitCode::FAILURE);
+            // cronie exits 0 after leaving the edits behind.
+            return EditOutcome::keep(ExitCode::SUCCESS);
         }
     }
 }

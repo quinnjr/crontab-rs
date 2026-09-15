@@ -1,6 +1,6 @@
 //! The set of crontabs currently loaded from disk, and how to refresh it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fs;
 use std::io::{self, Read as _};
@@ -12,8 +12,10 @@ use nix::unistd::{Uid, User};
 
 use crate::config::Config;
 use crate::crontab::{
-    Crontab, Diagnostic, EntryError, Format, ParseOptions, RandomDelay, inherited_process_env,
+    Crontab, Diagnostic, EntryError, Format, MAX_USER_ENTRIES, MAX_USER_ENVS, ParseOptions,
+    inherited_process_env,
 };
+use crate::tz::Zone;
 
 /// `(mtime, ctime, ctime_nsec)` — identifies a specific version of a file's
 /// metadata, so a `chmod`/`chown` that leaves `mtime` alone (but bumps
@@ -41,6 +43,9 @@ pub struct LoadedTab {
     /// For spool crontabs, the owning user (who runs every entry).
     pub owner: Option<String>,
     pub crontab: Crontab,
+    /// Zones for the non-empty `CRON_TZ` values the entries use, resolved
+    /// when the file was loaded.
+    pub zones: HashMap<String, Zone>,
     /// Name used in log messages (user name or file path).
     pub label: String,
 }
@@ -54,6 +59,9 @@ pub struct Database {
     random_scale: f64,
     /// Variables inherited from the daemon's environment into every crontab.
     inherited_env: Vec<(String, String)>,
+    /// Zones resolved during the current refresh, shared by the files it
+    /// loads so each `CRON_TZ` value is read once per pass.
+    zone_cache: HashMap<String, Zone>,
     /// Files that failed to load, with the metadata key they failed at, so
     /// errors are logged once per version of the file.
     bad: BTreeMap<PathBuf, MetaKey>,
@@ -98,6 +106,7 @@ impl Database {
             permissive,
             random_scale: random_scale.clamp(0.0, 1.0),
             inherited_env: inherited_process_env(),
+            zone_cache: HashMap::new(),
             bad: BTreeMap::new(),
             orphan_logged: BTreeMap::new(),
             tabs: BTreeMap::new(),
@@ -124,6 +133,7 @@ impl Database {
     /// Rescan all crontab locations.  Returns `true` when anything was
     /// added, removed or reloaded.
     pub fn refresh(&mut self) -> bool {
+        self.zone_cache.clear();
         let mut seen: Vec<PathBuf> = Vec::new();
         let mut changed = false;
 
@@ -345,40 +355,98 @@ impl Database {
 
         let mut bytes = Vec::new();
         let mut file = file;
-        let read_result = file.read_to_end(&mut bytes);
-        let text = match read_result {
-            Ok(_) => String::from_utf8_lossy(&bytes).into_owned(),
-            Err(e) => {
-                log::error!("({label}) CAN'T OPEN ({}): {e}", path.display());
-                self.bad.insert(path.to_path_buf(), key);
-                return self.tabs.remove(path).is_some();
-            }
-        };
+        if let Err(e) = file.read_to_end(&mut bytes) {
+            log::error!("({label}) CAN'T OPEN ({}): {e}", path.display());
+            self.bad.insert(path.to_path_buf(), key);
+            return self.tabs.remove(path).is_some();
+        }
         // cronie lets system crontabs and root hide jobs from the log.
         let options = ParseOptions {
             format,
             privileged: format == Format::System || owner_uid.is_some_and(|u| u.is_root()),
             inherited_env: self.inherited_env.clone(),
         };
-        let parsed = Crontab::parse_with(&text, &options);
-        // Like cronie's load_user: log each problem and keep every good entry.
+        let parsed = Crontab::parse_bytes(&bytes, &options);
+
+        // cronie's load_user fails a user crontab outright at the first of:
+        // too much comment/blank content, too many entries, too many variables.
+        let limit = if format == Format::User {
+            [
+                parsed.diagnostics.iter().find_map(|d| match d {
+                    Diagnostic::TooMuchGarbage { line } => {
+                        Some((*line, "too many garbage characters"))
+                    }
+                    _ => None,
+                }),
+                parsed
+                    .entry_lines
+                    .get(MAX_USER_ENTRIES)
+                    .map(|l| (*l, "too many entries")),
+                parsed
+                    .env_lines
+                    .get(MAX_USER_ENVS)
+                    .map(|l| (*l, "too many environment variables")),
+            ]
+            .into_iter()
+            .flatten()
+            .min_by_key(|(line, _)| *line)
+        } else {
+            None
+        };
+        let stop_line = limit.map(|(line, _)| line);
+
+        // Like load_user: report each problem as it is reached (log_it at the
+        // info level, naming the file) and keep every good entry.
         for diagnostic in &parsed.diagnostics {
+            let line = match diagnostic {
+                Diagnostic::Warning(w) => w.line,
+                Diagnostic::Error(e) => e.line,
+                Diagnostic::BadRandomDelay { line } | Diagnostic::TooMuchGarbage { line } => *line,
+            };
+            if stop_line.is_some_and(|stop| line >= stop) {
+                break;
+            }
             match diagnostic {
-                Diagnostic::Warning(w) => log::warn!("{w}"),
+                // cronie's parser prints step warnings to stderr.
+                Diagnostic::Warning(w) => eprintln!("{w}"),
                 Diagnostic::Error(e) => {
                     let msg = match e.error {
                         EntryError::PrematureEof => "missing newline before EOF".to_string(),
                         ref other => other.to_string(),
                     };
-                    log::error!("(CRON) {msg} ({}:{})", path.display(), e.line);
+                    log::info!("(CRON) {msg} ({})", path.display());
                 }
+                Diagnostic::BadRandomDelay { .. } => {
+                    log::info!("(CRON) ERROR (bad value of RANDOM_DELAY)");
+                }
+                Diagnostic::TooMuchGarbage { .. } => {}
             }
         }
-        for entry in &parsed.crontab.entries {
-            if entry.random_delay == RandomDelay::Invalid {
-                log::error!("(CRON) ERROR (bad value of RANDOM_DELAY)");
+        if let Some((_, reason)) = limit {
+            log::info!("(CRON) {reason} ({})", path.display());
+            log::info!("({label}) FAILED (loading cron table)");
+            self.bad.insert(path.to_path_buf(), key);
+            return self.tabs.remove(path).is_some();
+        }
+
+        let mut zones = HashMap::new();
+        for value in parsed
+            .crontab
+            .entries
+            .iter()
+            .filter_map(|e| e.cron_tz.as_deref())
+            .filter(|v| !v.is_empty())
+        {
+            if !zones.contains_key(value) {
+                let zone = self
+                    .zone_cache
+                    .entry(value.to_string())
+                    .or_insert_with(|| Zone::from_tz_value(value))
+                    .clone();
+                zones.insert(value.to_string(), zone);
             }
         }
+
         let verb = if self.tabs.contains_key(path) {
             "RELOAD"
         } else {
@@ -396,6 +464,7 @@ impl Database {
                 format,
                 owner,
                 crontab: parsed.crontab,
+                zones,
                 label,
             },
         );
@@ -465,6 +534,7 @@ fn check_file_security(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crontab::RandomDelay;
 
     fn test_config(dir: &Path) -> Config {
         Config {

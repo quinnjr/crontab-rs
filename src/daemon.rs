@@ -263,12 +263,7 @@ impl Scheduler {
         entry.user.clone().or_else(|| tab.owner.clone())
     }
 
-    fn dispatch(
-        &self,
-        tab: &LoadedTab,
-        entry: &Entry,
-        delay_minutes: u32,
-    ) -> Option<JoinHandle<bool>> {
+    fn dispatch(&self, tab: &LoadedTab, entry: &Entry) -> Option<JoinHandle<bool>> {
         let user = Self::job_user(tab, entry)?;
         let Some(slot) = self.slots.try_acquire(&user) else {
             log::error!(
@@ -280,21 +275,12 @@ impl Scheduler {
         };
         let runner = Arc::clone(&self.runner);
         let entry = entry.clone();
-        let label = tab.label.clone();
         let spawned = std::thread::Builder::new()
             .name(format!("job-{user}"))
             .spawn(move || {
                 let _slot = slot;
-                if delay_minutes > 0 {
-                    std::thread::sleep(Duration::from_secs(delay_minutes as u64 * 60));
-                }
-                match runner.run(&user, &entry) {
-                    Ok(_) => true,
-                    Err(e) => {
-                        log::error!("({label}) ERROR running job for {user}: {e}");
-                        false
-                    }
-                }
+                // Runner::run logs its own failures.
+                runner.run(&user, &entry).is_ok()
             });
         match spawned {
             Ok(h) => Some(h),
@@ -321,7 +307,7 @@ impl Scheduler {
                 .iter()
                 .filter(|e| e.schedule.is_reboot())
             {
-                handles.extend(self.dispatch(tab, entry, 0));
+                handles.extend(self.dispatch(tab, entry));
             }
         }
         handles
@@ -338,7 +324,6 @@ impl Scheduler {
         pass: Pass,
     ) -> Vec<JoinHandle<bool>> {
         let users_ok = self.cluster_allows_user_tabs();
-        let local = clock::wall_time(minute);
         let mut handles = Vec::new();
         for tab in self.db.tabs.values() {
             if tab.format == Format::User && !users_ok {
@@ -354,19 +339,29 @@ impl Scheduler {
                 if !wanted {
                     continue;
                 }
-                let t: NaiveDateTime = match &entry.tz {
+                // cronie applies RANDOM_DELAY by matching the job that many
+                // minutes late (cron.c: virtualSecond = (vtime - delay) * 60)
+                // and starting it right away, without holding anything.
+                let delay = match (self.honor_delay, entry.random_delay) {
+                    (true, RandomDelay::Minutes(max)) => {
+                        (f64::from(max) * self.db.random_scale()) as i64
+                    }
+                    _ => 0,
+                };
+                let at = minute - delay;
+                let t: NaiveDateTime = match entry.cron_tz.as_deref() {
+                    None => clock::wall_time(at),
+                    // cronie skips jobs with CRON_TZ set, even to an empty
+                    // value, while the local UTC offset is changing.
                     Some(_) if v_gmtoff != gmtoff => continue,
-                    Some(zone) => clock::wall_time_in_tz(minute, v_gmtoff, zone),
-                    None => local,
+                    Some("") => clock::wall_time(at),
+                    Some(value) => match tab.zones.get(value) {
+                        Some(zone) => clock::wall_time_in_tz(at, v_gmtoff, zone),
+                        None => continue,
+                    },
                 };
                 if entry.schedule.matches(&t) {
-                    let delay = match (self.honor_delay, entry.random_delay) {
-                        (true, RandomDelay::Minutes(max)) => {
-                            (f64::from(max) * self.db.random_scale()) as u32
-                        }
-                        _ => 0,
-                    };
-                    handles.extend(self.dispatch(tab, entry, delay));
+                    handles.extend(self.dispatch(tab, entry));
                 }
             }
         }
@@ -632,6 +627,91 @@ mod tests {
         join_all(sched.run_minute(minute, gmtoff, gmtoff, Pass::All));
         assert!(b.exists(), "user crontab must run on the cluster host");
         assert_eq!(sched.take_dispatch_failures(), 0);
+    }
+
+    #[test]
+    fn random_delay_shifts_matching_instead_of_sleeping() {
+        let me = nix::unistd::User::from_uid(nix::unistd::getuid())
+            .unwrap()
+            .unwrap()
+            .name;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            spool_dir: dir.path().join("spool"),
+            system_crontab: dir.path().join("crontab"),
+            cron_d_dir: dir.path().join("cron.d"),
+            ..Config::default()
+        };
+        let ran = dir.path().join("ran");
+        fs::write(
+            &cfg.system_crontab,
+            format!(
+                "RANDOM_DELAY=10\n0 * * * * {me} touch '{}'\n",
+                ran.display()
+            ),
+        )
+        .unwrap();
+        // A random scale of 1.0 makes the delay exactly RANDOM_DELAY.
+        let mut db = Database::new(cfg.clone(), true, 1.0);
+        db.refresh();
+        let runner = Arc::new(Runner {
+            default_path: cfg.default_path.clone(),
+            default_shell: cfg.default_shell.clone(),
+            inherit_path: false,
+            mailer: Mailer::Off,
+            hostname: "h".into(),
+        });
+        let sched = Scheduler::new(db, runner, false, true);
+        let top_of_hour = 29_820_240; // 2026-09-12 12:00 as a local minute
+        assert!(sched.run_minute(top_of_hour, 0, 0, Pass::All).is_empty());
+        let handles = sched.run_minute(top_of_hour + 10, 0, 0, Pass::All);
+        assert_eq!(handles.len(), 1, "due ten minutes late");
+        for h in handles {
+            assert!(h.join().unwrap());
+        }
+        assert!(ran.exists());
+        assert_eq!(
+            sched.slots.in_use(&me),
+            (0, 0),
+            "no slot held while delayed"
+        );
+    }
+
+    #[test]
+    fn empty_cron_tz_is_local_but_skipped_while_offset_changes() {
+        let me = nix::unistd::User::from_uid(nix::unistd::getuid())
+            .unwrap()
+            .unwrap()
+            .name;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            spool_dir: dir.path().join("spool"),
+            system_crontab: dir.path().join("crontab"),
+            cron_d_dir: dir.path().join("cron.d"),
+            ..Config::default()
+        };
+        let ran = dir.path().join("ran");
+        fs::write(
+            &cfg.system_crontab,
+            format!("CRON_TZ=\n0 12 * * * {me} touch '{}'\n", ran.display()),
+        )
+        .unwrap();
+        let mut db = Database::new(cfg.clone(), true, 0.0);
+        db.refresh();
+        let runner = Arc::new(Runner {
+            default_path: cfg.default_path.clone(),
+            default_shell: cfg.default_shell.clone(),
+            inherit_path: false,
+            mailer: Mailer::Off,
+            hostname: "h".into(),
+        });
+        let sched = Scheduler::new(db, runner, false, false);
+        let noon = 29_820_240; // 2026-09-12 12:00 as a local minute
+        assert!(sched.run_minute(noon, -3600, 0, Pass::All).is_empty());
+        for h in sched.run_minute(noon, 0, 0, Pass::All) {
+            assert!(h.join().unwrap());
+        }
+        assert!(ran.exists(), "empty CRON_TZ matches local wall time");
     }
 
     #[test]

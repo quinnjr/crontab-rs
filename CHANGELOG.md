@@ -27,7 +27,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `crontab` stops at the first syntax error, prints the warnings before it, and uses cronie's messages. `crontab -T` checks the leading `-` against the `-u` user.
 - `crond` and `crontab` exit with status 1 on usage errors and on `-h`, as in cronie.
 - `crond -n` no longer logs every line twice when its stderr is the systemd journal, and still logs to stderr when syslog is unavailable.
-- Library API: `Entry::quiet` is now `Entry::dont_log`, `Entry::tz` is an `Option<tz::Zone>`, and `Entry::random_delay` is a `RandomDelay`. `Crontab::random_delay` was removed. `Crontab::parse_with`, `ParseOptions`, `ParseOutput`, `Diagnostic` and the `tz` module were added. `EntryError::BadTimezone`, `BadRandomDelay` and `BadUsername` were removed, and `BadOption` and `PrematureEof` were added. `Schedule::parse_prefix_with` now takes a warnings sink.
+- `RANDOM_DELAY` delays a job by matching it late, as cronie does, instead of holding a job slot while sleeping.
+- Zone files are read only by `crond`, never by the set-user-ID `crontab`. FIFOs, devices and oversized files are treated as unreadable, crafted zone files can no longer abort the process, and set-ID programs get glibc's path restrictions. Zones are cached per reload.
+- Crontabs need not be UTF-8; commands and variables keep their exact bytes.
+- cronie's limits on variables, entries, comment content and field length are enforced by `crontab` and, for user crontabs, by `crond`.
+- `crontab -u` requires root even for your own name and cannot be combined with `-T`, `-n` or `-c`. `crontab` refuses to read a new crontab from a terminal without a file argument. `crontab -T` reports on stderr, and `crontab -e` exits 0 after leaving edits behind.
+- `crond` logs parser problems in cronie's format at the info level, logs an unknown user once, and backs off between syslog reconnects. Help and version output no longer panic on write errors.
+- Library API: `Entry::quiet` is now `Entry::dont_log`, `Entry::tz` was replaced by `Entry::cron_tz` (the raw value), and `Entry::random_delay` is a `RandomDelay`. `Crontab::random_delay` was removed. `Crontab::parse_with`, `Crontab::parse_bytes`, `Entry::encoding`, `ParseOptions`, `ParseOutput`, `Diagnostic` (including `BadRandomDelay` and `TooMuchGarbage`), the limit constants and the `tz` module were added. `EntryError::BadTimezone`, `BadRandomDelay` and `BadUsername` were removed, and `BadOption` and `PrematureEof` were added. `Schedule::parse_prefix_with` now takes a warnings sink.
 - The Arch package depends on `tzdata`, and `chrono-tz` is no longer a dependency.
 
 ## [0.1.1] - 2026-09-14

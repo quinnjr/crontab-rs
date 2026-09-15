@@ -79,9 +79,14 @@ where no job was due, exits zero.
 - `CRON_TZ` and `RANDOM_DELAY` apply to the entries after them. `CRON_TZ` is
   resolved like glibc's `TZ`: zone names, zoneinfo paths and POSIX strings with
   DST rules all work, and an unknown value means UTC. An empty `CRON_TZ` means
-  the daemon's local time. Jobs with `CRON_TZ` are skipped while the local UTC
-  offset is changing, as in cronie. An out-of-range `RANDOM_DELAY` is logged by
-  the daemon and ignored.
+  the daemon's local time. Jobs with `CRON_TZ` set, even to an empty value, are
+  skipped while the local UTC offset is changing, as in cronie.
+- Only `crond` reads zone files, never `crontab`. FIFOs, devices and oversized
+  files are treated as unreadable, and set-ID programs get glibc's path
+  restrictions.
+- `RANDOM_DELAY` makes a job run that many minutes (scaled by a random factor
+  chosen at startup) after its scheduled time, as cronie does. An out-of-range
+  value is logged by the daemon and ignored.
 - `LANG`, `LC_*`, `LANGUAGE`, `RANDOM_DELAY` and `MAILFROM` are inherited from
   the environment of `crond` (or `crontab`) before the file's own lines.
 - `@` shortcuts are case-sensitive. Environment lines follow cronie's parser,
@@ -93,6 +98,14 @@ where no job was due, exits zero.
   earlier warnings.
 - A `*` right after the time fields is a bad command, commands keep trailing
   spaces, and the last line must end with a newline.
+- Crontabs need not be UTF-8. Commands, variables and input keep their exact
+  bytes.
+- cronie's limits apply: 1000 variables, 10000 entries, 32768 characters of
+  comments and blank space between lines, and 131072-byte fields. `crontab`
+  refuses a file over them and `crond` does not load such a user crontab.
+- `-u` requires root, even for your own name, and cannot be combined with `-T`,
+  `-n` or `-c`. Without a file argument, `crontab` refuses to read a new
+  crontab from a terminal.
 - System crontab user field. `cron.d` skips `*.rpmsave`, `*.pacnew`, `*~` and
   other package-manager leftovers.
 

@@ -2,14 +2,30 @@
 
 use std::io::Write;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
 use syslog::{Facility, Formatter3164, LoggerBackend};
 
 type Syslog = syslog::Logger<LoggerBackend, Formatter3164>;
 
+/// How long to wait before trying to reach syslog again after a failed
+/// connection, so an absent socket doesn't cost a connect on every message.
+const RECONNECT_BACKOFF: Duration = Duration::from_secs(10);
+
+struct SyslogState {
+    logger: Option<Syslog>,
+    /// No connection attempts before this instant.
+    retry_after: Option<Instant>,
+}
+
+/// Whether a reconnect may be attempted now.
+fn may_reconnect(retry_after: Option<Instant>, now: Instant) -> bool {
+    retry_after.is_none_or(|t| now >= t)
+}
+
 struct CronLogger {
-    syslog: Mutex<Option<Syslog>>,
+    syslog: Mutex<SyslogState>,
     /// Copy every message to stderr.
     mirror: bool,
     /// Write to stderr when syslog is unreachable, even if `mirror` is off.
@@ -21,14 +37,23 @@ impl CronLogger {
     /// Send to syslog, connecting (or reconnecting once) as needed. Returns
     /// whether the message was delivered.
     fn send_syslog(&self, level: Level, msg: &str) -> bool {
-        let Ok(mut guard) = self.syslog.lock() else {
+        let Ok(mut state) = self.syslog.lock() else {
             return false;
         };
         for _ in 0..2 {
-            if guard.is_none() {
-                *guard = connect(&self.ident);
+            if state.logger.is_none() {
+                let now = Instant::now();
+                if !may_reconnect(state.retry_after, now) {
+                    return false;
+                }
+                state.logger = connect(&self.ident);
+                if state.logger.is_none() {
+                    state.retry_after = Some(now + RECONNECT_BACKOFF);
+                    return false;
+                }
+                state.retry_after = None;
             }
-            let Some(logger) = guard.as_mut() else {
+            let Some(logger) = state.logger.as_mut() else {
                 return false;
             };
             let sent = match level {
@@ -40,7 +65,8 @@ impl CronLogger {
             if sent.is_ok() {
                 return true;
             }
-            *guard = None;
+            // The connection broke; reconnect once right away.
+            state.logger = None;
         }
         false
     }
@@ -101,7 +127,10 @@ fn stderr_is_journal() -> bool {
 /// is reachable.
 pub fn init(ident: &str, stderr: bool, debug: bool) {
     let logger = CronLogger {
-        syslog: Mutex::new(connect(ident)),
+        syslog: Mutex::new(SyslogState {
+            logger: connect(ident),
+            retry_after: None,
+        }),
         mirror: stderr && !stderr_is_journal(),
         fallback_stderr: stderr,
         ident: ident.to_string(),
@@ -112,5 +141,18 @@ pub fn init(ident: &str, stderr: bool, debug: bool) {
         } else {
             LevelFilter::Info
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconnects_are_rate_limited() {
+        let now = Instant::now();
+        assert!(may_reconnect(None, now));
+        assert!(!may_reconnect(Some(now + RECONNECT_BACKOFF), now));
+        assert!(may_reconnect(Some(now), now));
     }
 }

@@ -35,6 +35,12 @@ use std::fmt;
 use chrono::{Datelike, NaiveDateTime, Timelike};
 use rand::{Rng, RngExt};
 
+use crate::crontab::MAX_COMMAND;
+
+/// Size of cronie's `get_number` buffer: a number or name token of this many
+/// characters or more is rejected.
+pub const MAX_TEMPSTR: usize = 131072;
+
 /// Error produced while parsing a time specification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScheduleError {
@@ -161,6 +167,9 @@ impl Schedule {
         if let Some(rest) = line.strip_prefix('@') {
             let end = rest.find(is_field_end).unwrap_or(rest.len());
             let (name, remainder) = rest.split_at(end);
+            // get_string(cmd, MAX_COMMAND, file, " \t\n") keeps at most
+            // MAX_COMMAND - 1 bytes (cut at a character boundary here).
+            let name = &name[..name.floor_char_boundary(MAX_COMMAND - 1)];
             let spec = match name {
                 "reboot" => return Ok((Schedule::reboot(), trim_blanks(remainder))),
                 "yearly" | "annually" => "0 0 1 1 *",
@@ -358,7 +367,8 @@ fn c_int_from_digits(digits: &str) -> i32 {
 /// cronie's `get_number`: a decimal number, or an exact (case-insensitive)
 /// three-letter name for fields that have names.
 fn get_number(token: &str, field: Field) -> Result<i32, ScheduleError> {
-    if token.is_empty() {
+    // cronie: `if (++len >= MAX_TEMPSTR) goto bad;`
+    if token.is_empty() || token.len() >= MAX_TEMPSTR {
         return Err(field.error());
     }
     if token.bytes().all(|b| b.is_ascii_digit()) {
@@ -380,7 +390,11 @@ fn optional_step(after: &str, field: Field) -> Result<i32, ScheduleError> {
     }
     let digits = after.strip_prefix('/').ok_or(field.error())?;
     let (token, rest) = take_alnum(digits);
-    if token.is_empty() || !rest.is_empty() || !token.bytes().all(|b| b.is_ascii_digit()) {
+    if token.is_empty()
+        || token.len() >= MAX_TEMPSTR
+        || !rest.is_empty()
+        || !token.bytes().all(|b| b.is_ascii_digit())
+    {
         return Err(field.error());
     }
     match c_int_from_digits(token) {
@@ -604,6 +618,33 @@ mod tests {
         assert_eq!(
             Schedule::parse("99999999999999999999999 * * * *"),
             Err(ScheduleError::BadMinute)
+        );
+    }
+
+    #[test]
+    fn tokens_reaching_max_tempstr_are_rejected() {
+        // Oracle: cronie 1.7.2 `crontab -T` accepts the 131071-character
+        // tokens and reports "bad minute" for the 131072-character ones.
+        let num = |len: usize| format!("{}5", "0".repeat(len - 1));
+        let s = sched(&format!("{} * * * *", num(MAX_TEMPSTR - 1)));
+        assert_eq!(minutes_fired(&s), vec![5]);
+        assert_eq!(
+            Schedule::parse(&format!("{} * * * *", num(MAX_TEMPSTR))),
+            Err(ScheduleError::BadMinute)
+        );
+        let s = sched(&format!("*/{} * * * *", num(MAX_TEMPSTR - 1)));
+        assert_eq!(minutes_fired(&s).len(), 12);
+        assert_eq!(
+            Schedule::parse(&format!("*/{} * * * *", num(MAX_TEMPSTR))),
+            Err(ScheduleError::BadMinute)
+        );
+        assert_eq!(
+            Schedule::parse(&format!("0-{} * * * *", num(MAX_TEMPSTR))),
+            Err(ScheduleError::BadMinute)
+        );
+        assert_eq!(
+            Schedule::parse(&format!("@{}", "d".repeat(MAX_COMMAND + 5))),
+            Err(ScheduleError::BadTimeSpecifier)
         );
     }
 

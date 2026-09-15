@@ -1,6 +1,7 @@
 //! Executing a single cron job: identity switch, environment, stdin,
 //! output capture and mail delivery.
 
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::unix::process::CommandExt;
@@ -62,7 +63,37 @@ impl Runner {
         env
     }
 
-    /// Run `entry` as `user`, wait for it, and deliver its output.
+    /// The environment handed to the job's shell: the same variables as
+    /// [`build_env`](Self::build_env), with crontab names and values in their
+    /// original bytes.
+    fn build_exec_env(&self, pw: &User, entry: &Entry) -> Vec<(OsString, OsString)> {
+        let path: OsString = if self.inherit_path {
+            std::env::var_os("PATH").unwrap_or_else(|| self.default_path.clone().into())
+        } else {
+            self.default_path.clone().into()
+        };
+        let mut env: Vec<(OsString, OsString)> = vec![
+            ("SHELL".into(), self.default_shell.clone().into()),
+            ("PATH".into(), path),
+            ("HOME".into(), pw.dir.clone().into_os_string()),
+            ("LOGNAME".into(), pw.name.clone().into()),
+            ("USER".into(), pw.name.clone().into()),
+        ];
+        for (k, v) in &entry.env {
+            if PROTECTED_VARS.contains(&k.as_str()) {
+                continue;
+            }
+            let (k, v) = (entry.os_of(k), entry.os_of(v));
+            match env.iter_mut().find(|(n, _)| *n == k) {
+                Some(slot) => slot.1 = v,
+                None => env.push((k, v)),
+            }
+        }
+        env
+    }
+
+    /// Run `entry` as `user`, wait for it, and deliver its output. Every
+    /// failure is logged here, once.
     pub fn run(&self, user: &str, entry: &Entry) -> io::Result<Outcome> {
         // cronie looks the user up when the job is due and skips it if the
         // user is unknown.
@@ -75,10 +106,18 @@ impl Runner {
                     "getpwnam() failed - user unknown",
                 ));
             }
-            Err(e) => return Err(io::Error::other(e)),
+            Err(e) => {
+                log::error!("({user}) ERROR (getpwnam() failed: {e})");
+                return Err(io::Error::other(e));
+            }
         };
-        let switch = should_switch(geteuid().as_raw(), pw.uid.as_raw())
-            .map_err(|e| io::Error::other(format!("cannot run job as {user}: {e}")))?;
+        let switch = match should_switch(geteuid().as_raw(), pw.uid.as_raw()) {
+            Ok(switch) => switch,
+            Err(e) => {
+                log::error!("({user}) ERROR (cannot run job: {e})");
+                return Err(io::Error::other(format!("cannot run job as {user}: {e}")));
+            }
+        };
         if switch
             && pw.uid.as_raw() != 0
             && let Some(expire) = shadow_expire(user)
@@ -102,23 +141,35 @@ impl Runner {
             None
         };
         let env = self.build_env(&pw, entry);
-        let shell = env_get(&env, "SHELL").unwrap_or("/bin/sh").to_string();
+        let exec_env = self.build_exec_env(&pw, entry);
+        let shell: OsString = exec_env
+            .iter()
+            .find(|(k, _)| k == "SHELL")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| "/bin/sh".into());
 
         if !entry.dont_log {
             log::info!("({user}) CMD ({})", entry.raw_command);
         }
 
-        let (read_end, write_end) =
-            nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).map_err(io::Error::other)?;
-        // try_clone uses F_DUPFD_CLOEXEC, so the duplicate is close-on-exec too.
-        let write_dup = write_end.try_clone()?;
+        let pipes = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
+            .map_err(io::Error::other)
+            // try_clone uses F_DUPFD_CLOEXEC, so the duplicate is close-on-exec too.
+            .and_then(|(r, w)| w.try_clone().map(|dup| (r, w, dup)));
+        let (read_end, write_end, write_dup) = match pipes {
+            Ok(p) => p,
+            Err(e) => {
+                log::error!("({user}) ERROR (can't create output pipe: {e})");
+                return Err(e);
+            }
+        };
 
         let mut cmd = Command::new(&shell);
         cmd.arg0(&shell)
             .arg("-c")
-            .arg(&entry.command)
+            .arg(entry.os_of(&entry.command))
             .env_clear()
-            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .envs(exec_env.iter().map(|(k, v)| (k, v)))
             .stdout(Stdio::from(write_end))
             .stderr(Stdio::from(write_dup))
             .stdin(if entry.stdin.is_some() {
@@ -138,14 +189,18 @@ impl Runner {
         let mut child = match spawned {
             Ok(c) => c,
             Err(e) => {
-                log::error!("({user}) ERROR (can't execute {shell}: {e})");
+                log::error!(
+                    "({user}) ERROR (can't execute {}: {e})",
+                    shell.to_string_lossy()
+                );
                 return Err(e);
             }
         };
 
-        let stdin_thread = match (child.stdin.take(), entry.stdin.clone()) {
+        let stdin_data = entry.stdin.as_deref().map(|s| entry.bytes_of(s));
+        let stdin_thread = match (child.stdin.take(), stdin_data) {
             (Some(mut pipe), Some(data)) => Some(std::thread::spawn(move || -> io::Result<()> {
-                pipe.write_all(data.as_bytes())
+                pipe.write_all(&data)
             })),
             _ => None,
         };
@@ -177,7 +232,13 @@ impl Runner {
                 format!("\n[crond: {discarded} bytes of output discarded]\n").as_bytes(),
             );
         }
-        let status = child.wait()?;
+        let status = match child.wait() {
+            Ok(status) => status,
+            Err(e) => {
+                log::error!("({user}) ERROR (waiting for job: {e})");
+                return Err(e);
+            }
+        };
         if let Some(t) = stdin_thread {
             match t.join() {
                 Ok(Ok(())) => {}

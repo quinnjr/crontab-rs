@@ -11,24 +11,51 @@
 //! * `-n` before the command mails output only when the job fails. It is the
 //!   only job option and may appear once.
 //! * `%` splits the command from its standard input.
-//! * `CRON_TZ` and `RANDOM_DELAY` apply to the entries after them.
+//! * `CRON_TZ` and `RANDOM_DELAY` apply to the entries after them. `CRON_TZ`
+//!   is kept as text; the parser never resolves zones or touches the
+//!   filesystem.
 //! * As in C, a NUL byte ends an environment line and a command.
+//! * cronie's buffer limits are ported: an environment line is examined only
+//!   up to [`MAX_ENVSTR`]` - 1` bytes, a system crontab's user name and a
+//!   command keep at most [`MAX_COMMAND`]` - 1` bytes, and more than
+//!   [`MAX_GARBAGE`] characters of blank/comment content between two content
+//!   lines is reported as [`Diagnostic::TooMuchGarbage`].
+//! * Limits count bytes of the original input. For UTF-8 input a truncation
+//!   stops at the last character boundary within the limit, where cronie would
+//!   cut a multi-byte character in half; this is the only divergence in the
+//!   limits.
+//! * Known divergence: after a bad job line cronie discards at most
+//!   [`MAX_COMMAND`] characters of the rest of that line, so it re-parses the
+//!   tail of an over-long bad line as a new line; this parser always discards
+//!   the whole line.
 //!
-//! [`Crontab::parse_with`] returns every valid entry together with warnings
-//! and errors in file order, so the daemon can skip bad lines (as cronie's
-//! `load_user` does) while `crontab` stops at the first error (as cronie's
-//! `check_syntax` does).
+//! [`Crontab::parse_with`] and [`Crontab::parse_bytes`] return every valid
+//! entry together with warnings and errors in file order, so the daemon can
+//! skip bad lines (as cronie's `load_user` does) while `crontab` stops at the
+//! first error (as cronie's `check_syntax` does).
 
+use std::ffi::OsString;
 use std::fmt;
+use std::os::unix::ffi::OsStringExt;
 
 use crate::schedule::{Schedule, ScheduleError, is_blank, trim_blanks};
-use crate::tz::Zone;
 
 /// Variables that a crontab may not override.
 pub const PROTECTED_VARS: &[&str] = &["LOGNAME", "USER"];
 
 /// Largest `RANDOM_DELAY` cronie accepts, in minutes.
 pub const MAX_RANDOM_DELAY: u32 = 24 * 60;
+
+/// Most environment assignments cronie accepts in a user crontab.
+pub const MAX_USER_ENVS: usize = 1000;
+/// Most job lines cronie accepts in a user crontab.
+pub const MAX_USER_ENTRIES: usize = 10000;
+/// Most blank/comment characters cronie skips between two content lines.
+pub const MAX_GARBAGE: usize = 32768;
+/// Size of cronie's environment line buffer (terminating NUL included).
+pub const MAX_ENVSTR: usize = 131072;
+/// Size of cronie's command and user name buffer (terminating NUL included).
+pub const MAX_COMMAND: usize = 131072;
 
 /// Variables cronie copies from its own environment into every crontab
 /// before the file's own assignments (`env_set_from_environ`).
@@ -51,6 +78,13 @@ pub const INHERITED_VARS: &[&str] = &[
     "RANDOM_DELAY",
     "MAILFROM",
 ];
+
+/// How a crontab's bytes were decoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextEncoding {
+    Utf8,
+    Latin1,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntryError {
@@ -114,6 +148,22 @@ impl fmt::Display for ParseWarning {
 pub enum Diagnostic {
     Warning(ParseWarning),
     Error(ParseError),
+    /// The RANDOM_DELAY in effect for the job on `line` is out of range. cronie's daemon logs
+    /// "bad value of RANDOM_DELAY" at this point in load_entry (after the time fields and user
+    /// field parse successfully, before the -n option is parsed); `crontab` prints nothing for it.
+    BadRandomDelay {
+        line: usize,
+    },
+    /// More than MAX_GARBAGE characters of blank/comment content were skipped before a content
+    /// line (cronie's skip_comments returning FALSE). Emitted at most once per gap.
+    ///
+    /// `line` is the number cronie's `crontab` prints (`LineNumber - 1`), not a plain line
+    /// number: if the character that exceeded the limit is the newline ending line N, it is N;
+    /// otherwise (a character inside line N, the first non-blank character of the content line
+    /// N, or the end of file after an unterminated line N) it is N - 1, so it can be 0.
+    TooMuchGarbage {
+        line: usize,
+    },
 }
 
 /// The `RANDOM_DELAY` in effect for an entry.
@@ -165,8 +215,9 @@ pub struct Entry {
     pub raw_command: String,
     /// Environment in effect for this entry, in declaration order.
     pub env: Vec<(String, String)>,
-    /// Zone from a non-empty `CRON_TZ`; `None` means the daemon's local time.
-    pub tz: Option<Zone>,
+    /// `CRON_TZ` in effect for this entry: `None` when unset, `Some("")` when
+    /// explicitly set to the empty string. Never resolved by the parser.
+    pub cron_tz: Option<String>,
     /// `-n` option: only mail output when the job fails.
     pub mail_on_failure_only: bool,
     /// Leading `-`: do not log the job.
@@ -175,6 +226,25 @@ pub struct Entry {
     pub random_delay: RandomDelay,
     /// 1-based source line number.
     pub line: usize,
+    /// How the crontab's bytes were decoded.
+    pub encoding: TextEncoding,
+}
+
+impl Entry {
+    /// The original crontab bytes of a string taken from this entry (command, raw_command, stdin, env names/values, user).
+    pub fn bytes_of(&self, s: &str) -> Vec<u8> {
+        match self.encoding {
+            TextEncoding::Utf8 => s.as_bytes().to_vec(),
+            // Latin-1 decoding maps every byte to the char with that code
+            // point, so every char is <= U+00FF.
+            TextEncoding::Latin1 => s.chars().map(|c| c as u32 as u8).collect(),
+        }
+    }
+
+    /// [`bytes_of`](Self::bytes_of) as an `OsString`.
+    pub fn os_of(&self, s: &str) -> OsString {
+        OsString::from_vec(self.bytes_of(s))
+    }
 }
 
 /// A parsed crontab file: its valid entries in file order.
@@ -248,6 +318,11 @@ pub struct ParseOutput {
     pub crontab: Crontab,
     /// Warnings and errors in file order.
     pub diagnostics: Vec<Diagnostic>,
+    /// 1-based line numbers of environment assignment lines, in file order.
+    pub env_lines: Vec<usize>,
+    /// 1-based line numbers of every line parsed as a job, valid or not, in file order
+    /// (what cronie's load_user counts against MAX_USER_ENTRIES).
+    pub entry_lines: Vec<usize>,
 }
 
 impl ParseOutput {
@@ -255,7 +330,7 @@ impl ParseOutput {
     pub fn errors(&self) -> impl Iterator<Item = &ParseError> {
         self.diagnostics.iter().filter_map(|d| match d {
             Diagnostic::Error(e) => Some(e),
-            Diagnostic::Warning(_) => None,
+            _ => None,
         })
     }
 
@@ -264,22 +339,39 @@ impl ParseOutput {
         self.errors().next().is_none()
     }
 
-    /// Diagnostics up to and including the first error. This is what cronie's
-    /// `crontab` reports, because its syntax check stops at the first error.
-    pub fn until_first_error(&self) -> &[Diagnostic] {
-        let end = self
-            .diagnostics
-            .iter()
-            .position(|d| matches!(d, Diagnostic::Error(_)))
-            .map_or(self.diagnostics.len(), |i| i + 1);
-        &self.diagnostics[..end]
+    /// Diagnostics up to and including the first `Error` or `TooMuchGarbage`,
+    /// without `BadRandomDelay` entries. This is what cronie's `crontab`
+    /// reports, because its syntax check stops at either.
+    pub fn until_first_error(&self) -> Vec<&Diagnostic> {
+        let mut out = Vec::new();
+        for d in &self.diagnostics {
+            match d {
+                Diagnostic::BadRandomDelay { .. } => {}
+                Diagnostic::Error(_) | Diagnostic::TooMuchGarbage { .. } => {
+                    out.push(d);
+                    break;
+                }
+                Diagnostic::Warning(_) => out.push(d),
+            }
+        }
+        out
+    }
+
+    /// The line of the first `Error` or `TooMuchGarbage` (for the latter, the
+    /// number cronie prints; see [`Diagnostic::TooMuchGarbage`]).
+    pub fn first_error_line(&self) -> Option<usize> {
+        self.diagnostics.iter().find_map(|d| match d {
+            Diagnostic::Error(e) => Some(e.line),
+            Diagnostic::TooMuchGarbage { line } => Some(*line),
+            _ => None,
+        })
     }
 }
 
 /// Parsing state carried from line to line.
 struct State {
     env: Vec<(String, String)>,
-    tz: Option<Zone>,
+    cron_tz: Option<String>,
     random_delay: RandomDelay,
 }
 
@@ -297,41 +389,153 @@ impl Crontab {
     }
 
     /// Parse crontab text, keeping every valid entry and reporting warnings
-    /// and errors in file order.
+    /// and errors in file order. Entries are tagged [`TextEncoding::Utf8`].
     pub fn parse_with(text: &str, options: &ParseOptions) -> ParseOutput {
-        let mut state = State {
-            env: Vec::new(),
-            tz: None,
-            random_delay: RandomDelay::Unset,
-        };
-        for (name, value) in &options.inherited_env {
-            state.assign(name.clone(), value.clone());
-        }
+        parse_text(text, options, TextEncoding::Utf8)
+    }
 
-        let mut entries = Vec::new();
-        let mut diagnostics = Vec::new();
-        let mut lines: Vec<&str> = text.split('\n').collect();
-        let unterminated = lines.pop().unwrap_or("");
-        for (idx, line) in lines.iter().enumerate() {
-            parse_line(
-                line,
-                idx + 1,
-                options,
-                &mut state,
-                &mut entries,
-                &mut diagnostics,
-            );
+    /// Parse raw crontab bytes: valid UTF-8 is parsed as text; otherwise every byte is mapped to
+    /// the char with that code point (Latin-1) so the grammar (all ASCII) and byte-exact
+    /// commands are preserved, and entries are tagged TextEncoding::Latin1.
+    pub fn parse_bytes(bytes: &[u8], options: &ParseOptions) -> ParseOutput {
+        match std::str::from_utf8(bytes) {
+            Ok(text) => parse_text(text, options, TextEncoding::Utf8),
+            Err(_) => {
+                let text: String = bytes.iter().map(|&b| char::from(b)).collect();
+                parse_text(&text, options, TextEncoding::Latin1)
+            }
         }
-        let tail = trim_blanks(unterminated);
-        if !tail.is_empty() && !tail.starts_with('#') {
-            diagnostics.push(Diagnostic::Error(ParseError {
-                line: lines.len() + 1,
+    }
+}
+
+fn parse_text(text: &str, options: &ParseOptions, encoding: TextEncoding) -> ParseOutput {
+    let mut state = State {
+        env: Vec::new(),
+        cron_tz: None,
+        random_delay: RandomDelay::Unset,
+    };
+    for (name, value) in &options.inherited_env {
+        state.assign(name.clone(), value.clone());
+    }
+
+    let mut parser = Parser {
+        options,
+        encoding,
+        state,
+        entries: Vec::new(),
+        diagnostics: Vec::new(),
+        env_lines: Vec::new(),
+        entry_lines: Vec::new(),
+        garbage: 0,
+        garbage_reported: false,
+    };
+    let mut lines: Vec<&str> = text.split('\n').collect();
+    let unterminated = lines.pop().unwrap_or("");
+    for (idx, line) in lines.iter().enumerate() {
+        parser.line(line, idx + 1);
+    }
+    if !unterminated.is_empty() {
+        let lineno = lines.len() + 1;
+        if parser.skip(unterminated, lineno, false).is_some() {
+            parser.diagnostics.push(Diagnostic::Error(ParseError {
+                line: lineno,
                 error: EntryError::PrematureEof,
             }));
         }
-        ParseOutput {
-            crontab: Crontab { entries },
-            diagnostics,
+    }
+    ParseOutput {
+        crontab: Crontab {
+            entries: parser.entries,
+        },
+        diagnostics: parser.diagnostics,
+        env_lines: parser.env_lines,
+        entry_lines: parser.entry_lines,
+    }
+}
+
+struct Parser<'o> {
+    options: &'o ParseOptions,
+    encoding: TextEncoding,
+    state: State,
+    entries: Vec<Entry>,
+    diagnostics: Vec<Diagnostic>,
+    env_lines: Vec<usize>,
+    entry_lines: Vec<usize>,
+    /// Characters `skip_comments` has counted in the current gap.
+    garbage: usize,
+    /// `TooMuchGarbage` was already emitted for the current gap.
+    garbage_reported: bool,
+}
+
+impl Parser<'_> {
+    /// Count `n` characters read by cronie's `skip_comments` on line
+    /// `lineno`; `ends_with_newline` says whether the last of them is the
+    /// line's newline.
+    fn count_garbage(&mut self, n: usize, lineno: usize, ends_with_newline: bool) {
+        if !self.garbage_reported && self.garbage + n > MAX_GARBAGE {
+            // 1-based index, within these n, of the character that pushed the
+            // count over the limit. cronie prints `LineNumber - 1`, and
+            // LineNumber has only moved past this line if that character is
+            // its newline.
+            let tripping = MAX_GARBAGE + 1 - self.garbage;
+            let line = if ends_with_newline && tripping == n {
+                lineno
+            } else {
+                lineno - 1
+            };
+            self.diagnostics.push(Diagnostic::TooMuchGarbage { line });
+            self.garbage_reported = true;
+        }
+        self.garbage = self.garbage.saturating_add(n);
+    }
+
+    /// cronie's `skip_comments` applied to one line: blank and comment lines
+    /// are counted as garbage and `None` is returned; for a content line the
+    /// leading blanks and first character are counted, the gap ends and the
+    /// line without its leading blanks is returned.
+    fn skip<'t>(&mut self, raw: &'t str, lineno: usize, terminated: bool) -> Option<&'t str> {
+        let line = trim_blanks(raw);
+        if line.is_empty() || line.starts_with('#') {
+            // Every character, plus the newline (or the EOF read after an
+            // unterminated last line).
+            let n = byte_len(raw, self.encoding) + 1;
+            self.count_garbage(n, lineno, terminated);
+            return None;
+        }
+        // Leading blanks are ASCII, so their byte count is the same in both
+        // encodings.
+        self.count_garbage(raw.len() - line.len() + 1, lineno, false);
+        self.garbage = 0;
+        self.garbage_reported = false;
+        Some(line)
+    }
+
+    fn line(&mut self, raw: &str, lineno: usize) {
+        let Some(line) = self.skip(raw, lineno, true) else {
+            return;
+        };
+        // cronie's load_env sees at most MAX_ENVSTR - 1 bytes of the line.
+        let env_view = truncate_bytes(line, MAX_ENVSTR - 1, self.encoding);
+        if let Some((name, value)) = parse_env_line(env_view) {
+            self.env_lines.push(lineno);
+            self.state.assign(name, value);
+            return;
+        }
+        self.entry_lines.push(lineno);
+        let result = parse_entry(
+            line,
+            lineno,
+            self.options,
+            &self.state,
+            self.encoding,
+            &mut self.diagnostics,
+        );
+        match result {
+            Ok(entry) => self.entries.push(entry),
+            Err(error) => self.diagnostics.push(Diagnostic::Error(ParseError {
+                line: lineno,
+                error,
+            })),
         }
     }
 }
@@ -339,8 +543,7 @@ impl Crontab {
 impl State {
     fn assign(&mut self, name: String, value: String) {
         match name.as_str() {
-            // cronie applies CRON_TZ only when it is non-empty.
-            "CRON_TZ" => self.tz = (!value.is_empty()).then(|| Zone::from_tz_value(&value)),
+            "CRON_TZ" => self.cron_tz = Some(value.clone()),
             "RANDOM_DELAY" => self.random_delay = RandomDelay::from_value(&value),
             _ => {}
         }
@@ -354,36 +557,23 @@ impl State {
     }
 }
 
-fn parse_line(
-    raw: &str,
-    lineno: usize,
-    options: &ParseOptions,
-    state: &mut State,
-    entries: &mut Vec<Entry>,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    let line = trim_blanks(raw);
-    if line.is_empty() || line.starts_with('#') {
-        return;
+/// Number of original input bytes in `s`.
+fn byte_len(s: &str, encoding: TextEncoding) -> usize {
+    match encoding {
+        TextEncoding::Utf8 => s.len(),
+        TextEncoding::Latin1 => s.chars().count(),
     }
-    if let Some((name, value)) = parse_env_line(line) {
-        state.assign(name, value);
-        return;
-    }
-    let mut warnings = Vec::new();
-    let result = parse_entry(line, lineno, options, state, &mut warnings);
-    diagnostics.extend(warnings.into_iter().map(|message| {
-        Diagnostic::Warning(ParseWarning {
-            line: lineno,
-            message,
-        })
-    }));
-    match result {
-        Ok(entry) => entries.push(entry),
-        Err(error) => diagnostics.push(Diagnostic::Error(ParseError {
-            line: lineno,
-            error,
-        })),
+}
+
+/// The longest prefix of `s` holding at most `max` original input bytes, as
+/// cronie's `get_string` keeps. UTF-8 input is cut at a character boundary.
+fn truncate_bytes(s: &str, max: usize, encoding: TextEncoding) -> &str {
+    match encoding {
+        TextEncoding::Utf8 => &s[..s.floor_char_boundary(max)],
+        TextEncoding::Latin1 => match s.char_indices().nth(max) {
+            Some((i, _)) => &s[..i],
+            None => s,
+        },
     }
 }
 
@@ -515,7 +705,8 @@ fn parse_entry(
     lineno: usize,
     options: &ParseOptions,
     state: &State,
-    warnings: &mut Vec<String>,
+    encoding: TextEncoding,
+    diagnostics: &mut Vec<Diagnostic>,
 ) -> Result<Entry, EntryError> {
     let mut line = line;
     let mut dont_log = false;
@@ -531,7 +722,15 @@ fn parse_entry(
         line = rest;
     }
 
-    let (schedule, rest) = Schedule::parse_prefix_with(line, &mut rand::rng(), warnings)?;
+    let mut warnings = Vec::new();
+    let parsed = Schedule::parse_prefix_with(line, &mut rand::rng(), &mut warnings);
+    diagnostics.extend(warnings.into_iter().map(|message| {
+        Diagnostic::Warning(ParseWarning {
+            line: lineno,
+            message,
+        })
+    }));
+    let (schedule, rest) = parsed?;
     // cronie: "check for premature EOL and catch a common typo".
     if rest.is_empty() || rest.starts_with('*') {
         return Err(EntryError::BadCommand);
@@ -546,9 +745,16 @@ fn parse_entry(
             if remainder.is_empty() {
                 return Err(EntryError::BadCommand);
             }
-            (Some(c_str(user).to_string()), remainder)
+            // get_string(username, MAX_COMMAND, ..) keeps MAX_COMMAND - 1 bytes.
+            let user = truncate_bytes(c_str(user), MAX_COMMAND - 1, encoding);
+            (Some(user.to_string()), remainder)
         }
     };
+
+    // load_entry checks RANDOM_DELAY here, before the job options.
+    if state.random_delay == RandomDelay::Invalid {
+        diagnostics.push(Diagnostic::BadRandomDelay { line: lineno });
+    }
 
     let mut mail_on_failure_only = false;
     while let Some(after_dash) = rest.strip_prefix('-') {
@@ -567,8 +773,9 @@ fn parse_entry(
         }
     }
 
-    // The command is everything up to the newline, trailing blanks included.
-    let raw_command = c_str(rest).to_string();
+    // The command is everything up to the newline, trailing blanks included,
+    // limited like get_string(cmd, MAX_COMMAND, ..).
+    let raw_command = truncate_bytes(c_str(rest), MAX_COMMAND - 1, encoding).to_string();
     let (command, stdin) = split_command(&raw_command);
 
     Ok(Entry {
@@ -578,11 +785,12 @@ fn parse_entry(
         stdin,
         raw_command,
         env: state.env.clone(),
-        tz: state.tz.clone(),
+        cron_tz: state.cron_tz.clone(),
         mail_on_failure_only,
         dont_log,
         random_delay: state.random_delay,
         line: lineno,
+        encoding,
     })
 }
 
@@ -626,6 +834,7 @@ pub fn split_command(raw: &str) -> (String, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::ffi::OsStrExt;
 
     fn pair(n: &str, v: &str) -> Option<(String, String)> {
         Some((n.to_string(), v.to_string()))
@@ -701,6 +910,7 @@ mod tests {
                 ("MAILTO".into(), "alice".into())
             ]
         );
+        assert_eq!(e.encoding, TextEncoding::Utf8);
         let e = &tab.entries[1];
         assert!(e.mail_on_failure_only && !e.dont_log);
         assert_eq!(env_get(&e.env, "LOGNAME"), None);
@@ -735,6 +945,7 @@ mod tests {
             ]
         );
         assert_eq!(out.until_first_error().len(), 2);
+        assert_eq!(out.first_error_line(), Some(2));
         assert!(!out.is_valid());
         assert_eq!(
             Crontab::parse("0 0 * * * a\n88 * * * * d\n", Format::User)
@@ -755,6 +966,7 @@ mod tests {
                 error: EntryError::PrematureEof
             })]
         );
+        assert_eq!(out.entry_lines, vec![1]);
         assert!(user("0 0 * * * a\n# trailing comment").is_valid());
         assert!(user("0 0 * * * a\n  \t").is_valid());
         assert!(user("").is_valid());
@@ -870,26 +1082,271 @@ mod tests {
     }
 
     #[test]
-    fn cron_tz_empty_means_local() {
-        let tokyo_exists = std::path::Path::new("/usr/share/zoneinfo/Asia/Tokyo").exists();
+    fn cron_tz_is_kept_as_text() {
         let tab = Crontab::parse(
-            "CRON_TZ=Asia/Tokyo\n0 9 * * * a\nCRON_TZ=\n0 9 * * * b\n0 9 * * * c\n",
+            "0 9 * * * u\nCRON_TZ=Asia/Tokyo\n0 9 * * * a\nCRON_TZ=\n0 9 * * * b\n0 9 * * * c\n",
             Format::User,
         )
         .unwrap();
-        if tokyo_exists {
-            assert_eq!(tab.entries[0].tz, Some(Zone::from_tz_value("Asia/Tokyo")));
-        }
-        assert!(tab.entries[0].tz.is_some());
-        assert_eq!(tab.entries[1].tz, None);
-        assert_eq!(env_get(&tab.entries[1].env, "CRON_TZ"), Some(""));
+        let tzs: Vec<_> = tab.entries.iter().map(|e| e.cron_tz.as_deref()).collect();
+        assert_eq!(tzs, vec![None, Some("Asia/Tokyo"), Some(""), Some("")]);
+        assert_eq!(env_get(&tab.entries[1].env, "CRON_TZ"), Some("Asia/Tokyo"));
+        assert_eq!(env_get(&tab.entries[2].env, "CRON_TZ"), Some(""));
+    }
+
+    #[test]
+    fn parsing_never_opens_cron_tz_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "crontab-rs-cron-tz-fifo-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let fifo_str = fifo.to_str().unwrap().to_string();
+        let text =
+            format!("CRON_TZ=/nonexistent/fifo\n0 0 * * * a\nCRON_TZ={fifo_str}\n0 0 * * * b\n");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(Crontab::parse(&text, Format::User));
+        });
+        let result = rx.recv_timeout(std::time::Duration::from_secs(5));
+        let _ = std::fs::remove_dir_all(&dir);
+        let tab = result.expect("parsing blocked on a CRON_TZ file").unwrap();
+        assert_eq!(tab.entries[0].cron_tz.as_deref(), Some("/nonexistent/fifo"));
+        assert_eq!(tab.entries[1].cron_tz.as_deref(), Some(fifo_str.as_str()));
+    }
+
+    #[test]
+    fn parse_bytes_keeps_original_bytes() {
+        let options = ParseOptions::new(Format::User);
+        let input: &[u8] = b"A=caf\xe9\n0 0 * * * echo caf\xe9 %in\xe9\n";
+        let out = Crontab::parse_bytes(input, &options);
+        assert!(out.is_valid());
+        let e = &out.crontab.entries[0];
+        assert_eq!(e.encoding, TextEncoding::Latin1);
+        assert_eq!(e.bytes_of(&e.command), b"echo caf\xe9 ");
+        assert_eq!(e.bytes_of(e.stdin.as_deref().unwrap()), b"in\xe9\n");
+        assert_eq!(e.os_of(&e.raw_command).as_bytes(), b"echo caf\xe9 %in\xe9");
+        assert_eq!(e.bytes_of(env_get(&e.env, "A").unwrap()), b"caf\xe9");
+
+        let out = Crontab::parse_bytes("0 0 * * * echo café\n".as_bytes(), &options);
+        let e = &out.crontab.entries[0];
+        assert_eq!(e.encoding, TextEncoding::Utf8);
+        assert_eq!(e.command, "echo café");
+        assert_eq!(e.bytes_of(&e.command), "echo café".as_bytes());
+        assert_eq!(e.os_of(&e.command).as_bytes(), "echo café".as_bytes());
+    }
+
+    #[test]
+    fn bad_random_delay_is_reported_where_load_entry_checks_it() {
+        let out = user("RANDOM_DELAY=5000\n0 0 * * * -x cmd\n");
         assert_eq!(
-            Crontab::parse("0 9 * * * x\n", Format::User)
-                .unwrap()
-                .entries[0]
-                .tz,
-            None
+            out.diagnostics,
+            vec![
+                Diagnostic::BadRandomDelay { line: 2 },
+                Diagnostic::Error(ParseError {
+                    line: 2,
+                    error: EntryError::BadOption
+                }),
+            ]
         );
+        assert_eq!(out.until_first_error(), vec![&out.diagnostics[1]]);
+        assert_eq!(out.first_error_line(), Some(2));
+
+        let out = user("RANDOM_DELAY=5000\n99 0 * * * x\n");
+        assert_eq!(
+            out.diagnostics,
+            vec![Diagnostic::Error(ParseError {
+                line: 2,
+                error: ScheduleError::BadMinute.into()
+            })]
+        );
+
+        let sys = ParseOptions::new(Format::System);
+        let out = Crontab::parse_with("RANDOM_DELAY=-1\n0 0 * * * root\n", &sys);
+        assert_eq!(first_error(&out), Some(EntryError::BadCommand));
+        assert_eq!(out.diagnostics.len(), 1);
+
+        let out = user("RANDOM_DELAY=-1\n0 0 * * * x\n@daily y\n");
+        assert!(out.is_valid());
+        assert_eq!(
+            out.diagnostics,
+            vec![
+                Diagnostic::BadRandomDelay { line: 2 },
+                Diagnostic::BadRandomDelay { line: 3 }
+            ]
+        );
+        assert!(out.until_first_error().is_empty());
+        assert_eq!(out.first_error_line(), None);
+    }
+
+    fn comment(len: usize) -> String {
+        format!("#{}\n", "a".repeat(len - 1))
+    }
+
+    #[test]
+    fn garbage_limit_follows_skip_comments() {
+        let job = "0 0 * * * x\n";
+        let m = MAX_GARBAGE;
+        // A skipped line counts its characters plus its newline; the content
+        // line then counts its first character. Oracle: cronie 1.7.2 `crontab -T`.
+        let ok = user(&format!("{}{job}", comment(m - 2)));
+        assert!(ok.diagnostics.is_empty());
+        assert_eq!(ok.first_error_line(), None);
+
+        // One more character trips on the job's first character: cronie
+        // prints line 1.
+        let out = user(&format!("{}{job}", comment(m - 1)));
+        assert_eq!(
+            out.diagnostics,
+            vec![Diagnostic::TooMuchGarbage { line: 1 }]
+        );
+        assert!(out.is_valid());
+        assert_eq!(out.crontab.entries.len(), 1);
+        assert_eq!(out.first_error_line(), Some(1));
+
+        // Tripping on a comment's newline prints that line.
+        let out = user(&format!("x=1\n{}{job}", comment(m)));
+        assert_eq!(
+            out.diagnostics,
+            vec![Diagnostic::TooMuchGarbage { line: 2 }]
+        );
+        // Tripping inside a comment prints the line before it.
+        let out = user(&format!("x=1\n{}{job}", comment(m + 11)));
+        assert_eq!(
+            out.diagnostics,
+            vec![Diagnostic::TooMuchGarbage { line: 1 }]
+        );
+        let out = user(&format!("{}{job}", comment(m + 11)));
+        assert_eq!(
+            out.diagnostics,
+            vec![Diagnostic::TooMuchGarbage { line: 0 }]
+        );
+
+        // Leading blanks of the content line count too.
+        let blanks = "\n".repeat(m - 1);
+        assert!(user(&format!("{blanks}{job}")).diagnostics.is_empty());
+        let out = user(&format!("{blanks} {job}"));
+        assert_eq!(
+            out.diagnostics,
+            vec![Diagnostic::TooMuchGarbage { line: m - 1 }]
+        );
+
+        // An unterminated final comment counts the EOF read.
+        assert!(
+            user(&format!("{job}#{}", "a".repeat(m - 2)))
+                .diagnostics
+                .is_empty()
+        );
+        let out = user(&format!("{job}#{}", "a".repeat(m - 1)));
+        assert_eq!(
+            out.diagnostics,
+            vec![Diagnostic::TooMuchGarbage { line: 1 }]
+        );
+
+        // Once per gap, and it stops until_first_error.
+        let out = user(&format!("{}{}{job}99 * * * * y\n", comment(m), comment(m)));
+        assert_eq!(
+            out.diagnostics,
+            vec![
+                Diagnostic::TooMuchGarbage { line: 1 },
+                Diagnostic::Error(ParseError {
+                    line: 4,
+                    error: ScheduleError::BadMinute.into()
+                })
+            ]
+        );
+        assert_eq!(out.until_first_error(), vec![&out.diagnostics[0]]);
+        assert_eq!(out.first_error_line(), Some(1));
+        assert_eq!(out.crontab.entries.len(), 1);
+
+        // Latin-1 input counts bytes.
+        let options = ParseOptions::new(Format::User);
+        let latin = |n: usize| {
+            let mut v = b"#".to_vec();
+            v.extend(std::iter::repeat_n(0xe9u8, n - 1));
+            v.extend_from_slice(b"\n0 0 * * * x\n");
+            Crontab::parse_bytes(&v, &options)
+        };
+        assert!(latin(m - 2).diagnostics.is_empty());
+        assert_eq!(
+            latin(m - 1).diagnostics,
+            vec![Diagnostic::TooMuchGarbage { line: 1 }]
+        );
+    }
+
+    #[test]
+    fn env_and_entry_lines() {
+        let out = user(
+            "# c\nA=1\n0 0 * * * a\n\n99 * * * * bad\nB=2\n  @daily c\n* * * * * -q x\n0 0 * * * tail",
+        );
+        assert_eq!(out.env_lines, vec![2, 6]);
+        assert_eq!(out.entry_lines, vec![3, 5, 7, 8]);
+    }
+
+    #[test]
+    fn env_line_is_examined_up_to_max_envstr() {
+        let job = "0 0 * * * x\n";
+        // `A="` + k + `"` is exactly MAX_ENVSTR - 1 bytes: the junk after the
+        // closing quote is cut off and the line is an assignment (oracle: no
+        // error). One more byte cuts the closing quote: a bad job.
+        let k = MAX_ENVSTR - 1 - 4;
+        let out = user(&format!("A=\"{}\" junk\n{job}", "x".repeat(k)));
+        assert!(out.is_valid());
+        assert_eq!(out.env_lines, vec![1]);
+        assert_eq!(
+            env_get(&out.crontab.entries[0].env, "A").map(str::len),
+            Some(k)
+        );
+        let out = user(&format!("A=\"{}\" junk\n{job}", "x".repeat(k + 1)));
+        assert_eq!(first_error(&out), Some(ScheduleError::BadMinute.into()));
+        assert_eq!(out.entry_lines, vec![1, 2]);
+
+        // An unquoted value keeps MAX_ENVSTR - 1 bytes of the whole line.
+        let out = user(&format!("  A={}\n{job}", "v".repeat(MAX_ENVSTR)));
+        assert_eq!(
+            env_get(&out.crontab.entries[0].env, "A").map(str::len),
+            Some(MAX_ENVSTR - 1 - 2)
+        );
+    }
+
+    #[test]
+    fn user_and_command_keep_max_command_minus_one_bytes() {
+        let mc = MAX_COMMAND;
+        let out = user(&format!("0 0 * * * {}\n", "c".repeat(mc + 10)));
+        assert_eq!(out.crontab.entries[0].command.len(), mc - 1);
+
+        // The stdin split happens on the truncated command.
+        let out = user(&format!("0 0 * * * a%{}\n", "b".repeat(mc)));
+        let e = &out.crontab.entries[0];
+        assert_eq!(e.raw_command.len(), mc - 1);
+        assert_eq!(e.stdin.as_ref().map(String::len), Some(mc - 3 + 1));
+
+        let sys = ParseOptions::new(Format::System);
+        let out = Crontab::parse_with(&format!("0 0 * * * {} cmd\n", "u".repeat(mc + 5)), &sys);
+        let e = &out.crontab.entries[0];
+        assert_eq!(e.user.as_ref().map(String::len), Some(mc - 1));
+        assert_eq!(e.command, "cmd");
+
+        // UTF-8 input is cut at a character boundary.
+        let out = user(&format!("0 0 * * * {}é\n", "a".repeat(mc - 2)));
+        assert_eq!(out.crontab.entries[0].command, "a".repeat(mc - 2));
+        // Latin-1 input counts one byte per character.
+        let mut bytes = b"0 0 * * * ".to_vec();
+        bytes.extend(std::iter::repeat_n(b'a', mc - 2));
+        bytes.extend_from_slice(b"\xe9\xe9\n");
+        let out = Crontab::parse_bytes(&bytes, &ParseOptions::new(Format::User));
+        let e = &out.crontab.entries[0];
+        let got = e.bytes_of(&e.command);
+        assert_eq!(got.len(), mc - 1);
+        assert_eq!(got.last(), Some(&0xe9));
     }
 
     #[test]

@@ -120,9 +120,14 @@ fn install_list_remove() {
     assert!(o.status.success(), "{}", stderr(&o));
     assert_eq!(stdout(&env.crontab(&["-l"], None)), "@daily true\n");
 
-    // -u for yourself is allowed.
+    // As in cronie, -u needs root even for your own name.
     let o = env.crontab(&["-u", &me(), "-l"], None);
-    assert!(o.status.success());
+    assert_eq!(
+        o.status.success(),
+        nix::unistd::geteuid().is_root(),
+        "{}",
+        stderr(&o)
+    );
 
     // -ri with "n" keeps it; -r removes it.
     let o = env.crontab(&["-r", "-i"], Some("n\n"));
@@ -151,7 +156,9 @@ fn test_mode() {
     let env = Env::new();
     let o = env.crontab(&["-T", "-"], Some("0 0 * * * ok\n"));
     assert!(o.status.success());
-    assert!(stdout(&o).contains("No syntax issues"));
+    // cronie prints the result of -T on stderr.
+    assert!(stderr(&o).contains("No syntax issues"), "{}", stderr(&o));
+    assert!(stdout(&o).is_empty());
     let o = env.crontab(&["-T", "-"], Some("0 0 * * 9 bad\n"));
     assert!(!o.status.success());
     assert!(stderr(&o).contains("bad day-of-week"));
@@ -188,7 +195,7 @@ fn edit_via_editor() {
     let o = env
         .cmd(env!("CARGO_BIN_EXE_crontab"))
         .arg("-e")
-        .env("VISUAL", &script)
+        .env("VISUAL", format!("/bin/sh {}", script.display()))
         .stdin(Stdio::null())
         .output()
         .unwrap();
@@ -212,15 +219,22 @@ fn edit_via_editor() {
     let mut child = env
         .cmd(env!("CARGO_BIN_EXE_crontab"))
         .arg("-e")
-        .env("VISUAL", &bad)
+        .env("VISUAL", format!("/bin/sh {}", bad.display()))
         .stdin(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     child.stdin.take().unwrap().write_all(b"n\n").unwrap();
     let o = child.wait_with_output().unwrap();
-    assert!(!o.status.success());
-    assert!(stderr(&o).contains("bad minute"));
+    let err = stderr(&o);
+    // cronie leaves the edits behind and exits 0.
+    assert!(o.status.success(), "{err}");
+    assert!(err.contains("bad minute"), "{err}");
+    let left = err
+        .lines()
+        .find_map(|l| l.strip_prefix("crontab: edits left in "))
+        .expect("edits left in message");
+    let _ = fs::remove_file(left);
     assert_eq!(stdout(&env.crontab(&["-l"], None)), "0 4 * * * edited\n");
 }
 
@@ -330,7 +344,7 @@ fn set_cluster_host_requires_root() {
     let o = env.crontab(&["-n", "somehost"], None);
     assert!(!o.status.success());
     assert!(
-        stderr(&o).contains("must be privileged to set the cluster host"),
+        stderr(&o).contains("must be privileged to set host with -n"),
         "{}",
         stderr(&o)
     );
@@ -421,6 +435,12 @@ fn crond_skips_only_jobs_for_unknown_users() {
         !o.status.success(),
         "run-at reports the job that could not run"
     );
+    assert_eq!(
+        err.matches("getpwnam() failed").count(),
+        1,
+        "logged once: {err}"
+    );
+    assert!(!err.contains("ERROR running job for"), "{err}");
 }
 
 #[test]
@@ -474,16 +494,177 @@ fn syntax_check_stops_at_first_error() {
 }
 
 #[test]
-fn syntax_check_uses_the_u_user() {
+fn u_flag_conflicts_with_test_and_cluster_options() {
     if !nix::unistd::geteuid().is_root() {
         return;
     }
     let env = Env::new();
-    let o = env.crontab(&["-u", "nobody", "-T", "-"], Some("-* * * * * x\n"));
+    let o = env.crontab(&["-u", "nobody", "-T", "-"], Some("0 0 * * * x\n"));
     assert!(!o.status.success());
-    assert!(stderr(&o).contains("bad option"), "{}", stderr(&o));
-    let o = env.crontab(&["-T", "-"], Some("-* * * * * x\n"));
+    assert!(
+        stderr(&o).contains("cannot use -u with -n, -c or -T"),
+        "{}",
+        stderr(&o)
+    );
+    let o = env.crontab(&["-u", "nobody", "-c"], None);
+    assert!(!o.status.success());
+    assert!(
+        stderr(&o).contains("cannot use -u with -n or -c"),
+        "{}",
+        stderr(&o)
+    );
+}
+
+/// Wait for a child, killing it and failing the test after `secs` seconds.
+fn wait_or_fail(mut child: std::process::Child, secs: u64, what: &str) -> std::process::ExitStatus {
+    let start = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if start.elapsed() > Duration::from_secs(secs) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{what} hung");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn output_write_errors_do_not_panic() {
+    let env = Env::new();
+    // stdout is a pipe whose reader is already gone.
+    let (reader, writer) = nix::unistd::pipe().unwrap();
+    drop(reader);
+    let o = env
+        .cmd(env!("CARGO_BIN_EXE_crontab"))
+        .arg("-V")
+        .stdout(Stdio::from(writer))
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(!stderr(&o).contains("panicked"), "{}", stderr(&o));
+    let full = fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    let o = env
+        .crond()
+        .arg("-h")
+        .stderr(Stdio::from(full))
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(1));
+}
+
+#[test]
+fn syntax_check_enforces_cronie_limits() {
+    let env = Env::new();
+    let envs: String = (0..1001).map(|i| format!("V{i}=x\n")).collect();
+    let o = env.crontab(&["-T", "-"], Some(&envs));
+    assert!(!o.status.success());
+    assert!(
+        stderr(&o)
+            .contains("There are too many environment variables in the crontab file. Limit: 1000"),
+        "{}",
+        stderr(&o)
+    );
+    let entries: String = (0..10001).map(|_| "0 0 * * * true\n").collect();
+    let o = env.crontab(&["-T", "-"], Some(&entries));
+    assert!(!o.status.success());
+    assert!(
+        stderr(&o).contains("There are too many entries in the crontab file. Limit: 10000"),
+        "{}",
+        stderr(&o)
+    );
+    let garbage = format!("{}\n0 0 * * * x\n", "#".repeat(40000));
+    let o = env.crontab(&["-T", "-"], Some(&garbage));
+    assert!(!o.status.success());
+    assert!(
+        stderr(&o).contains("too much non-parseable content"),
+        "{}",
+        stderr(&o)
+    );
+}
+
+#[test]
+fn non_utf8_crontabs_keep_their_bytes() {
+    use std::os::unix::ffi::OsStrExt;
+    let env = Env::new();
+    fs::create_dir(env.path("out")).unwrap();
+    let target = env
+        .path("out")
+        .join(std::ffi::OsStr::from_bytes(b"caf\xe9"));
+    let mut tab = format!("* * * * * {} touch '", me()).into_bytes();
+    tab.extend_from_slice(target.as_os_str().as_bytes());
+    tab.extend_from_slice(b"'\n");
+    fs::write(env.path("cron.d").join("latin1"), &tab).unwrap();
+    let o = env
+        .crond()
+        .args(["-p", "-m", "off", "--run-at", "2026-01-01 00:00"])
+        .output()
+        .unwrap();
     assert!(o.status.success(), "{}", stderr(&o));
+    assert!(
+        target.exists(),
+        "the command's bytes must reach the shell unchanged"
+    );
+
+    let user_tab = b"# caf\xe9\n0 0 * * * echo caf\xe9\n".to_vec();
+    let mut child = env
+        .cmd(env!("CARGO_BIN_EXE_crontab"))
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(&user_tab).unwrap();
+    let o = child.wait_with_output().unwrap();
+    assert!(o.status.success(), "{}", stderr(&o));
+    let o = env
+        .cmd(env!("CARGO_BIN_EXE_crontab"))
+        .arg("-l")
+        .output()
+        .unwrap();
+    assert_eq!(o.stdout, user_tab);
+}
+
+#[test]
+fn cron_tz_naming_a_fifo_does_not_hang() {
+    let env = Env::new();
+    let fifo = env.path("tzfifo");
+    nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+    let mut child = env
+        .cmd(env!("CARGO_BIN_EXE_crontab"))
+        .args(["-T", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("CRON_TZ={}\n* * * * * true\n", fifo.display()).as_bytes())
+        .unwrap();
+    assert!(wait_or_fail(child, 10, "crontab -T with a CRON_TZ FIFO").success());
+
+    fs::write(
+        env.path("cron.d").join("fifo-tz"),
+        format!("CRON_TZ={}\n* * * * * {} true\n", fifo.display(), me()),
+    )
+    .unwrap();
+    let child = env
+        .crond()
+        .args(["-p", "-m", "off", "--run-at", "2026-01-01 00:00"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_or_fail(child, 10, "crond with a CRON_TZ FIFO");
 }
 
 #[test]
@@ -611,7 +792,7 @@ fn edit_temp_file_is_cleaned_up() {
     let o = env
         .cmd(env!("CARGO_BIN_EXE_crontab"))
         .arg("-e")
-        .env("VISUAL", &script)
+        .env("VISUAL", format!("/bin/sh {}", script.display()))
         .env("TMPDIR", tmp_dir.path())
         .stdin(Stdio::null())
         .output()

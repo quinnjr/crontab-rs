@@ -64,9 +64,19 @@ impl Runner {
 
     /// Run `entry` as `user`, wait for it, and deliver its output.
     pub fn run(&self, user: &str, entry: &Entry) -> io::Result<Outcome> {
-        let pw = User::from_name(user)
-            .map_err(io::Error::other)?
-            .ok_or_else(|| io::Error::other(format!("no passwd entry for {user}")))?;
+        // cronie looks the user up when the job is due and skips it if the
+        // user is unknown.
+        let pw = match User::from_name(user) {
+            Ok(Some(pw)) => pw,
+            Ok(None) => {
+                log::error!("({user}) ERROR (getpwnam() failed - user unknown)");
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "getpwnam() failed - user unknown",
+                ));
+            }
+            Err(e) => return Err(io::Error::other(e)),
+        };
         let switch = should_switch(geteuid().as_raw(), pw.uid.as_raw())
             .map_err(|e| io::Error::other(format!("cannot run job as {user}: {e}")))?;
         if switch
@@ -366,8 +376,7 @@ mod tests {
             .run("no-such-user-xyz123", &entry("* * * * * true\n"))
             .unwrap_err();
         assert!(
-            err.to_string()
-                .contains("no passwd entry for no-such-user-xyz123"),
+            err.to_string().contains("getpwnam() failed - user unknown"),
             "{err}"
         );
     }

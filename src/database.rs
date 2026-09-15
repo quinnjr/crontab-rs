@@ -8,10 +8,12 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use nix::unistd::User;
+use nix::unistd::{Uid, User};
 
 use crate::config::Config;
-use crate::crontab::{Crontab, Format};
+use crate::crontab::{
+    Crontab, Diagnostic, EntryError, Format, ParseOptions, RandomDelay, inherited_process_env,
+};
 
 /// `(mtime, ctime, ctime_nsec)` — identifies a specific version of a file's
 /// metadata, so a `chmod`/`chown` that leaves `mtime` alone (but bumps
@@ -39,9 +41,6 @@ pub struct LoadedTab {
     /// For spool crontabs, the owning user (who runs every entry).
     pub owner: Option<String>,
     pub crontab: Crontab,
-    /// Per-entry delay in minutes, aligned with `crontab.entries`: each
-    /// entry's `RANDOM_DELAY` scaled by the daemon's random factor.
-    pub delays: Vec<u32>,
     /// Name used in log messages (user name or file path).
     pub label: String,
 }
@@ -53,6 +52,8 @@ pub struct Database {
     permissive: bool,
     /// Uniform random factor in `[0, 1]` chosen once per daemon run.
     random_scale: f64,
+    /// Variables inherited from the daemon's environment into every crontab.
+    inherited_env: Vec<(String, String)>,
     /// Files that failed to load, with the metadata key they failed at, so
     /// errors are logged once per version of the file.
     bad: BTreeMap<PathBuf, MetaKey>,
@@ -96,6 +97,7 @@ impl Database {
             cfg,
             permissive,
             random_scale: random_scale.clamp(0.0, 1.0),
+            inherited_env: inherited_process_env(),
             bad: BTreeMap::new(),
             orphan_logged: BTreeMap::new(),
             tabs: BTreeMap::new(),
@@ -108,6 +110,11 @@ impl Database {
         self.tabs.clear();
         self.bad.clear();
         self.orphan_logged.clear();
+    }
+
+    /// The factor every `RANDOM_DELAY` is scaled by in this daemon run.
+    pub fn random_scale(&self) -> f64 {
+        self.random_scale
     }
 
     pub fn config(&self) -> &Config {
@@ -313,11 +320,11 @@ impl Database {
                 }
             }
         }
-        let mut owner_uid: Option<u32> = None;
+        let mut owner_uid: Option<Uid> = None;
         if let Some(user) = &owner {
             match User::from_name(user) {
                 Ok(Some(u)) => {
-                    owner_uid = Some(u.uid.as_raw());
+                    owner_uid = Some(u.uid);
                     self.orphan_logged.remove(path);
                 }
                 Ok(None) => {
@@ -348,80 +355,51 @@ impl Database {
             }
         };
         // cronie lets system crontabs and root hide jobs from the log.
-        let privileged = format == Format::System || owner_uid == Some(0);
-        match Crontab::parse_as(&text, format, privileged) {
-            Ok(crontab) => {
-                for w in &crontab.warnings {
-                    log::warn!("({label}) {} ({}:{})", w.message, path.display(), w.line);
+        let options = ParseOptions {
+            format,
+            privileged: format == Format::System || owner_uid.is_some_and(|u| u.is_root()),
+            inherited_env: self.inherited_env.clone(),
+        };
+        let parsed = Crontab::parse_with(&text, &options);
+        // Like cronie's load_user: log each problem and keep every good entry.
+        for diagnostic in &parsed.diagnostics {
+            match diagnostic {
+                Diagnostic::Warning(w) => log::warn!("{w}"),
+                Diagnostic::Error(e) => {
+                    let msg = match e.error {
+                        EntryError::PrematureEof => "missing newline before EOF".to_string(),
+                        ref other => other.to_string(),
+                    };
+                    log::error!("(CRON) {msg} ({}:{})", path.display(), e.line);
                 }
-                // cronie rejects a system crontab naming an unknown user.
-                if format == Format::System {
-                    for entry in &crontab.entries {
-                        let Some(user) = entry.user.as_deref() else {
-                            continue;
-                        };
-                        match User::from_name(user) {
-                            Ok(Some(_)) => {}
-                            Ok(None) => {
-                                log::error!(
-                                    "({label}) BAD CRONTAB ({}): line {}: bad username",
-                                    path.display(),
-                                    entry.line
-                                );
-                                self.bad.insert(path.to_path_buf(), key);
-                                return self.tabs.remove(path).is_some();
-                            }
-                            Err(e) => {
-                                log::warn!("({label}) CAN'T LOOKUP USER ({e})");
-                                return false;
-                            }
-                        }
-                    }
-                }
-                let delays = crontab
-                    .entries
-                    .iter()
-                    .map(|e| match e.random_delay {
-                        Some(max) => (max as f64 * self.random_scale) as u32,
-                        None => {
-                            if crate::crontab::env_get(&e.env, "RANDOM_DELAY").is_some() {
-                                log::error!("({label}) ERROR (bad value of RANDOM_DELAY)");
-                            }
-                            0
-                        }
-                    })
-                    .collect();
-                let verb = if self.tabs.contains_key(path) {
-                    "RELOAD"
-                } else {
-                    "LOAD"
-                };
-                log::info!("({label}) {verb} ({})", path.display());
-                self.bad.remove(path);
-                self.tabs.insert(
-                    path.to_path_buf(),
-                    LoadedTab {
-                        path: path.to_path_buf(),
-                        mtime: key.0,
-                        ctime: key.1,
-                        ctime_nsec: key.2,
-                        format,
-                        owner,
-                        crontab,
-                        delays,
-                        label,
-                    },
-                );
-                true
-            }
-            Err(errors) => {
-                for e in &errors {
-                    log::error!("({label}) BAD CRONTAB ({}): {e}", path.display());
-                }
-                self.bad.insert(path.to_path_buf(), key);
-                self.tabs.remove(path).is_some()
             }
         }
+        for entry in &parsed.crontab.entries {
+            if entry.random_delay == RandomDelay::Invalid {
+                log::error!("(CRON) ERROR (bad value of RANDOM_DELAY)");
+            }
+        }
+        let verb = if self.tabs.contains_key(path) {
+            "RELOAD"
+        } else {
+            "LOAD"
+        };
+        log::info!("({label}) {verb} ({})", path.display());
+        self.bad.remove(path);
+        self.tabs.insert(
+            path.to_path_buf(),
+            LoadedTab {
+                path: path.to_path_buf(),
+                mtime: key.0,
+                ctime: key.1,
+                ctime_nsec: key.2,
+                format,
+                owner,
+                crontab: parsed.crontab,
+                label,
+            },
+        );
+        true
     }
 }
 
@@ -525,21 +503,34 @@ mod tests {
         fs::write(&spool, "RANDOM_DELAY=10\n0 1 * * * echo user2\n").unwrap();
         filetime_bump(&spool);
         assert!(db.refresh());
+        assert_eq!(db.random_scale(), 0.5);
         let tab = &db.tabs[&spool];
         assert_eq!(tab.crontab.entries[0].command, "echo user2");
-        assert_eq!(tab.delays, vec![5]);
+        assert_eq!(
+            tab.crontab.entries[0].random_delay,
+            RandomDelay::Minutes(10)
+        );
         assert_eq!(tab.owner.as_deref(), Some(me().as_str()));
 
-        // Break it: entry is unloaded, error logged once.
-        fs::write(&spool, "99 * * * * echo bad\n").unwrap();
+        // A bad line is skipped and logged, as in cronie; the crontab stays
+        // loaded with its good lines.
+        fs::write(&spool, "99 * * * * echo bad\n0 2 * * * echo good\n").unwrap();
         filetime_bump(&spool);
         assert!(db.refresh());
-        assert!(!db.tabs.contains_key(&spool));
+        let commands: Vec<&str> = db.tabs[&spool]
+            .crontab
+            .entries
+            .iter()
+            .map(|e| e.command.as_str())
+            .collect();
+        assert_eq!(commands, vec!["echo good"]);
         assert!(!db.refresh());
 
+        // The system crontab and the user crontab (still holding its good
+        // line) remain.
         fs::remove_file(cfg.cron_d_dir.join("job")).unwrap();
         assert!(db.refresh());
-        assert_eq!(db.tabs.len(), 1);
+        assert_eq!(db.tabs.len(), 2);
     }
 
     /// Ensure the file's mtime differs from any earlier observation.

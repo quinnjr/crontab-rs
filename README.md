@@ -32,7 +32,8 @@ its path is printed ("edits left in ...") so you don't lose the changes.
 ### `crond`
 
 ```
--n / -f   foreground (also log to stderr, unless stderr is the systemd journal)
+-n / -f   foreground (also log to stderr, unless stderr is the systemd journal
+          and syslog is reachable)
 -p        permit any crontab (skip ownership/mode checks)
 -s        send job output to syslog instead of mail
 -m CMD    mail command reading an RFC 822 message on stdin, or "off"
@@ -53,19 +54,20 @@ syslog under the `cron` facility.
 
 `--run-at` rejects an unparsable time with "bad --run-at time" and a non-zero
 exit. It also exits non-zero if any job that was due could not be run, for
-example because the daemon is not root and the job belongs to another user.
-A system crontab naming an unknown user is rejected when it loads, so its jobs
-never become due. A normal run where every due job started, or where no job
-was due, exits zero.
+example because the daemon is not root and the job belongs to another user, or
+the job's user does not exist. A normal run where every due job started, or
+where no job was due, exits zero.
 
 ## Crontab syntax supported
 
 - Five time fields: numbers, ranges, lists, and steps (`*/15`, `1-10/3`).
   A step may only follow `*` or a range. A step larger than its range is
   accepted with cronie's warning. A reversed range such as `5-3` selects nothing.
+  Numbers follow C `int` conversion, as in cronie.
   Month and weekday names are the three-letter abbreviations in any case, and
   `7` means Sunday.
-- cronie's random ranges: `~`, `~30`, `10~20`. A random range takes no step.
+- cronie's random ranges: `~`, `~30`, `10~20`. A random range takes no step,
+  and only the value it picks must be in range.
 - Shortcuts: `@reboot @yearly @annually @monthly @weekly @daily @midnight @hourly`.
 - Classic day-of-month / day-of-week OR rule when both fields are restricted.
 - `%` sends the rest of the line to stdin, and `\%` gives a literal `%`.
@@ -74,12 +76,23 @@ was due, exits zero.
 - Environment lines, including quoted values. `LOGNAME` and `USER` are protected.
   `SHELL`, `PATH` and `HOME` can be overridden.
 - `MAILTO` (empty disables mail), `MAILFROM`, `CONTENT_TYPE`.
-- `CRON_TZ` and `RANDOM_DELAY` apply to the entries after them. An unknown or
-  empty `CRON_TZ` means UTC, as with glibc. An out-of-range `RANDOM_DELAY` is
-  logged by the daemon and ignored.
+- `CRON_TZ` and `RANDOM_DELAY` apply to the entries after them. `CRON_TZ` is
+  resolved like glibc's `TZ`: zone names, zoneinfo paths and POSIX strings with
+  DST rules all work, and an unknown value means UTC. An empty `CRON_TZ` means
+  the daemon's local time. Jobs with `CRON_TZ` are skipped while the local UTC
+  offset is changing, as in cronie. An out-of-range `RANDOM_DELAY` is logged by
+  the daemon and ignored.
+- `LANG`, `LC_*`, `LANGUAGE`, `RANDOM_DELAY` and `MAILFROM` are inherited from
+  the environment of `crond` (or `crontab`) before the file's own lines.
 - `@` shortcuts are case-sensitive. Environment lines follow cronie's parser,
   so names such as `1FOO` are valid.
-- A system crontab that names an unknown user is rejected as a whole.
+- `crond` skips a line with an error and logs it, and runs the rest of the
+  crontab. A job naming an unknown user is skipped when it is due, with
+  cronie's "getpwnam() failed - user unknown" message. `crontab` refuses to
+  install a file with an error and stops at the first one, printing any
+  earlier warnings.
+- A `*` right after the time fields is a bad command, commands keep trailing
+  spaces, and the last line must end with a newline.
 - System crontab user field. `cron.d` skips `*.rpmsave`, `*.pacnew`, `*~` and
   other package-manager leftovers.
 

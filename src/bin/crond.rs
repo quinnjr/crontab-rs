@@ -59,18 +59,9 @@ struct Cli {
 }
 
 fn main() -> ExitCode {
-    let cli = match Cli::try_parse() {
+    let cli = match crontab_rs::cli::parse_args::<Cli>() {
         Ok(cli) => cli,
-        Err(e) => {
-            // cronie exits 1 on usage errors; help and version exit 0.
-            let _ = e.print();
-            return match e.kind() {
-                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => {
-                    ExitCode::SUCCESS
-                }
-                _ => ExitCode::FAILURE,
-            };
-        }
+        Err(code) => return code,
     };
     let foreground = cli.foreground || cli.foreground_f || cli.run_at.is_some();
     let cfg = Config::from_env();
@@ -130,7 +121,7 @@ fn main() -> ExitCode {
         let minute = t.and_utc().timestamp().div_euclid(60);
         sched.db.refresh();
         let mut failed = 0usize;
-        for h in sched.run_minute(minute, gmtoff, Pass::All) {
+        for h in sched.run_minute(minute, gmtoff, gmtoff, Pass::All) {
             match h.join() {
                 Ok(true) => {}
                 Ok(false) => failed += 1,

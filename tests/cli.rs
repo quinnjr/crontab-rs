@@ -108,9 +108,14 @@ fn install_list_remove() {
     let o = env.crontab(&["-l"], None);
     assert_eq!(stdout(&o), tab);
 
-    // Install from a file path, adding a missing trailing newline.
+    // Install from a file path. As in cronie, the last line needs a newline.
     let file = env.path("mytab");
     fs::write(&file, "@daily true").unwrap();
+    let o = env.crontab(&[file.to_str().unwrap()], None);
+    assert!(!o.status.success());
+    assert!(stderr(&o).contains(":1: premature EOF"), "{}", stderr(&o));
+    assert!(stderr(&o).contains("Invalid crontab file, can't install."));
+    fs::write(&file, "@daily true\n").unwrap();
     let o = env.crontab(&[file.to_str().unwrap()], None);
     assert!(o.status.success(), "{}", stderr(&o));
     assert_eq!(stdout(&env.crontab(&["-l"], None)), "@daily true\n");
@@ -389,11 +394,11 @@ fn run_at_bad_time_fails() {
 }
 
 #[test]
-fn crond_rejects_system_crontab_with_unknown_user() {
+fn crond_skips_only_jobs_for_unknown_users() {
     let env = Env::new();
     let out = env.path("ran");
     fs::write(
-        env.path("cron.d").join("badjob"),
+        env.path("cron.d").join("mixed"),
         format!(
             "* * * * * {} touch {}\n* * * * * no-such-user-xyz123 echo x\n",
             me(),
@@ -406,10 +411,79 @@ fn crond_rejects_system_crontab_with_unknown_user() {
         .args(["-p", "-m", "off", "--run-at", "2026-01-01 00:00"])
         .output()
         .unwrap();
+    let err = stderr(&o);
+    assert!(out.exists(), "jobs for known users still run: {err}");
+    assert!(
+        err.contains("(no-such-user-xyz123) ERROR (getpwnam() failed - user unknown)"),
+        "{err}"
+    );
+    assert!(
+        !o.status.success(),
+        "run-at reports the job that could not run"
+    );
+}
+
+#[test]
+fn crond_keeps_good_lines_when_one_is_bad() {
+    let env = Env::new();
+    let (a, c) = (env.path("a"), env.path("c"));
+    fs::write(
+        env.path("cron.d").join("partly-bad"),
+        format!(
+            "* * * * * {me} touch {a}\n99 * * * * {me} touch nope\n* * * * * {me} touch {c}\n* * * * * {me} touch unterminated",
+            me = me(),
+            a = a.display(),
+            c = c.display()
+        ),
+    )
+    .unwrap();
+    let o = env
+        .crond()
+        .args(["-p", "-m", "off", "--run-at", "2026-01-01 00:00"])
+        .output()
+        .unwrap();
+    let err = stderr(&o);
+    assert!(o.status.success(), "{err}");
+    assert!(a.exists() && c.exists(), "{err}");
+    assert!(err.contains("(CRON) bad minute ("), "{err}");
+    assert!(err.contains("(CRON) missing newline before EOF ("), "{err}");
+}
+
+#[test]
+fn syntax_check_stops_at_first_error() {
+    let env = Env::new();
+    let o = env.crontab(
+        &["-T", "-"],
+        Some("*/61 * * * * x\n99 * * * * y\n88 * * * * z\n"),
+    );
+    assert!(!o.status.success());
+    let err = stderr(&o);
+    let warning = err.find("Warning: Step size 61").expect("warning printed");
+    let first = err
+        .find("\"-\":2: bad minute")
+        .expect("first error printed");
+    assert!(warning < first, "{err}");
+    assert!(!err.contains(":3:"), "{err}");
+    let o = env.crontab(&["-T", "-"], Some("0 0 * * * x"));
+    assert!(!o.status.success());
+    assert!(
+        stderr(&o).contains("\"-\":1: premature EOF"),
+        "{}",
+        stderr(&o)
+    );
+}
+
+#[test]
+fn syntax_check_uses_the_u_user() {
+    if !nix::unistd::geteuid().is_root() {
+        return;
+    }
+    let env = Env::new();
+    let o = env.crontab(&["-u", "nobody", "-T", "-"], Some("-* * * * * x\n"));
+    assert!(!o.status.success());
+    assert!(stderr(&o).contains("bad option"), "{}", stderr(&o));
+    let o = env.crontab(&["-T", "-"], Some("-* * * * * x\n"));
     assert!(o.status.success(), "{}", stderr(&o));
-    assert!(stderr(&o).contains("BAD CRONTAB"), "{}", stderr(&o));
-    assert!(stderr(&o).contains("bad username"), "{}", stderr(&o));
-    assert!(!out.exists(), "no job from a rejected file may run");
 }
 
 #[test]
@@ -436,8 +510,13 @@ fn usage_errors_exit_1_like_cronie() {
     assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
     let o = env.crond().arg("-Z").output().unwrap();
     assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
-    let o = env.crontab(&["--help"], None);
-    assert_eq!(o.status.code(), Some(0));
+    // cronie prints help to stderr and exits 1.
+    let o = env.crontab(&["-h"], None);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stderr(&o).contains("Usage"), "{}", stderr(&o));
+    assert!(stdout(&o).is_empty());
+    let o = env.crond().arg("-h").output().unwrap();
+    assert_eq!(o.status.code(), Some(1));
 }
 
 #[test]
@@ -449,7 +528,8 @@ fn syntax_test_matches_cronie_grammar() {
         ("@HOURLY x", false),
         ("0~59/10 * * * * x", false),
         ("* * * * * -q x", false),
-        ("-* * * * * x", false),
+        ("-* * * * * x", nix::unistd::geteuid().is_root()),
+        ("0 */5 * * * * cmd", false),
         ("5-3 * * * * x", true),
         ("* * * * sat-sun x", true),
         ("1FOO=bar", true),

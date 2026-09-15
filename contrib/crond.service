@@ -1,0 +1,14 @@
+[Unit]
+Description=Command Scheduler (crontab-rs)
+After=auditd.service nss-user-lookup.target systemd-user-sessions.service time-sync.target ypbind.service autofs.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/crond -n
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=process
+Restart=on-failure
+RestartSec=30s
+
+[Install]
+WantedBy=multi-user.target
